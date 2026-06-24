@@ -78,8 +78,8 @@ def _world_orient_island(faces, uv_layer, matrix):
 
     if abs_n.z >= abs_n.x and abs_n.z >= abs_n.y:
         x_idx, y_idx = 0, 1
-        flip_x = avg_normal.z < 0
-        flip_y = False
+        flip_x = False
+        flip_y = avg_normal.z < 0
     elif abs_n.y >= abs_n.x and abs_n.y >= abs_n.z:
         x_idx, y_idx = 0, 2
         flip_x = avg_normal.y > 0
@@ -109,40 +109,45 @@ def _world_orient_island(faces, uv_layer, matrix):
     if not calc_loops:
         calc_loops = list(island_loops)
 
-    n_edges = 0
+    total_weight = 0.0
     avg_angle = 0.0
     for loop in calc_loops:
         co0 = matrix @ loop.vert.co
         co1 = matrix @ loop.link_loop_next.vert.co
         delta_3d = co1 - co0
-        max_side = max(abs(delta_3d.x), abs(delta_3d.y), abs(delta_3d.z))
 
-        if abs(delta_3d[x_idx]) == max_side or abs(delta_3d[y_idx]) == max_side:
-            n_edges += 1
-            uv0 = loop[uv_layer].uv
-            uv1 = loop.link_loop_next[uv_layer].uv
-            delta_uv = uv1 - uv0
+        proj_len = abs(delta_3d[x_idx]) + abs(delta_3d[y_idx])
+        if proj_len < 1e-8:
+            continue
 
-            dx = delta_3d[x_idx] if not flip_x else -delta_3d[x_idx]
-            dy = delta_3d[y_idx] if not flip_y else -delta_3d[y_idx]
+        uv0 = loop[uv_layer].uv
+        uv1 = loop.link_loop_next[uv_layer].uv
+        delta_uv = uv1 - uv0
+        uv_len = delta_uv.length
+        if uv_len < 1e-8:
+            continue
 
-            a0 = atan2(dy, dx)
-            a1 = atan2(delta_uv.y, delta_uv.x)
-            a_delta = atan2(sin(a0 - a1), cos(a0 - a1))
+        dx = delta_3d[x_idx] if not flip_x else -delta_3d[x_idx]
+        dy = delta_3d[y_idx] if not flip_y else -delta_3d[y_idx]
 
-            if n_edges > 1:
-                prev_avg = avg_angle / (n_edges - 1)
-                if abs(prev_avg - a_delta) > math.pi - 0.02:
-                    avg_angle += (a_delta - 2 * math.pi) if a_delta > 0 else (a_delta + 2 * math.pi)
-                else:
-                    avg_angle += a_delta
-            else:
-                avg_angle += a_delta
+        a0 = atan2(dy, dx)
+        a1 = atan2(delta_uv.y, delta_uv.x)
+        a_delta = atan2(sin(a0 - a1), cos(a0 - a1))
 
-    if n_edges == 0:
+        weight = proj_len * uv_len
+
+        if total_weight == 0.0:
+            avg_angle = a_delta
+            total_weight = weight
+        else:
+            diff = a_delta - avg_angle
+            diff = atan2(sin(diff), cos(diff))
+            avg_angle += diff * (weight / (total_weight + weight))
+            total_weight += weight
+
+    if total_weight == 0.0:
         return
 
-    avg_angle /= n_edges
     if abs(avg_angle) > 1e-6:
         center = _island_center(faces, uv_layer)
         ca, sa = cos(avg_angle), sin(avg_angle)
@@ -304,17 +309,6 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
 
         props = context.scene.cs2wd_props
 
-        # Auto-orient all UV islands to world before distribution
-        bm = bmesh.from_edit_mesh(obj.data)
-        uv_layer = bm.loops.layers.uv.verify()
-        bm.faces.ensure_lookup_table()
-        all_islands = _get_uv_islands(bm, uv_layer)
-        for island in all_islands:
-            _world_orient_island(island, uv_layer, obj.matrix_world)
-        bmesh.update_edit_mesh(obj.data)
-        if DEBUG_TILE_SCALES:
-            print(f"cs2wd DISTRIBUTE: auto-oriented {len(all_islands)} island(s)")
-
         tile_padding = 0.0
         island_padding = 0.001
         # Determine current mode for user feedback (e.g., "just blank" if only Blank)
@@ -336,6 +330,10 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
         mode_label = _mode(props)
         if DEBUG_TILE_SCALES:
             print("cs2wd MODE:", mode_label)
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        uv_layer = bm.loops.layers.uv.verify()
+        bm.faces.ensure_lookup_table()
 
         # -----------------------------
         # 1. Detect UV islands (only for selected faces)
@@ -520,8 +518,8 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
 # -----------------------------
 class CS2WD_OT_WorldOrient(bpy.types.Operator):
     bl_idname = "cs2wd.world_orient"
-    bl_label = "Orient Islands"
-    bl_description = "Orientate selected UV islands to world orientation before distribution"
+    bl_label = "Orientate UVs"
+    bl_description = "Orientate selected UV islands to world orientation"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -581,7 +579,12 @@ class CS2WD_PT_MainPanel(bpy.types.Panel):
             layout.prop(props, "curtains")
             layout.prop(props, "use_specific_tiles")
         layout.separator()
-        # Distribute button (auto-orients before distribution)
+        # Orientate UVs button
+        row = layout.row(align=True)
+        row.scale_y = 1.5
+        row.operator("cs2wd.world_orient", icon='WORLD')
+        layout.separator()
+        # Distribute button
         op = layout.operator("cs2wd.distribute_uv", icon='UV')
 
 # -----------------------------
