@@ -289,129 +289,100 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.object
-        if not obj or obj.type != 'MESH':
-            return False
-        props = getattr(context.scene, 'cs2wd_props', None)
-        if not props:
-            return False
-        try:
-            return bool(props.validate_window_selection())
-        except Exception:
-            return False
+        if any(obj.type == 'MESH' for obj in context.selected_objects if obj.mode == 'EDIT'):
+            props = getattr(context.scene, 'cs2wd_props', None)
+            if props:
+                try:
+                    return bool(props.validate_window_selection())
+                except Exception:
+                    pass
+        return False
 
-    def execute(self, context):
-        obj = context.object
-        if not obj or obj.type != 'MESH':
-            return {'CANCELLED'}
-        if context.mode != 'EDIT_MESH':
-            return {'CANCELLED'}
-
-        props = context.scene.cs2wd_props
-
-        tile_padding = 0.0
-        island_padding = 0.001
-        # Determine current mode for user feedback (e.g., "just blank" if only Blank)
-        def _mode(p):
-            opts = [
-                ("Blinds Open", p.blinds_open),
-                ("Blinds Vertical", p.blinds_vertical),
-                ("Blinds Closed", p.blinds_closed),
-                ("Blank", p.use_specific_tiles),
-            ]
-            active = [name for name, val in opts if val]
-            if not active:
-                return "none"
-            if len(active) == 1:
-                if "Blank" in active:
-                    return "just blank"
-                return active[0].lower()
-            return "mixed"
-        mode_label = _mode(props)
-        if DEBUG_TILE_SCALES:
-            print("cs2wd MODE:", mode_label)
-
+    def _collect_island_data(self, obj):
         bm = bmesh.from_edit_mesh(obj.data)
         uv_layer = bm.loops.layers.uv.verify()
         bm.faces.ensure_lookup_table()
 
-        # -----------------------------
-        # 1. Detect UV islands (only for selected faces)
-        # -----------------------------
         islands = []
         visited = set()
-
-        # Simple face selection for now
         selected_faces = [f for f in bm.faces if f.select]
         faces_to_process = selected_faces if selected_faces else bm.faces
 
         for face in faces_to_process:
             if face in visited:
                 continue
-
             island = set()
             stack = [face]
-
             while stack:
                 f = stack.pop()
                 if f in island:
                     continue
-
                 island.add(f)
                 visited.add(f)
-
                 for loop in f.loops:
                     for linked in loop.vert.link_loops:
                         if linked.face in island:
                             continue
                         if (loop[uv_layer].uv - linked[uv_layer].uv).length < 1e-6:
                             stack.append(linked.face)
-
             islands.append(island)
 
-        if not islands:
-            return {'CANCELLED'}
-
-        # -----------------------------
-        # 2. Cache island data
-        # -----------------------------
-        island_data = []
-
+        data_list = []
         for island in islands:
             uvs = []
             coords = []
-
             for f in island:
                 for l in f.loops:
                     uvs.append(l[uv_layer])
                     coords.append(l[uv_layer].uv.copy())
-
+            if not coords:
+                continue
             min_x = min(v.x for v in coords)
             max_x = max(v.x for v in coords)
             min_y = min(v.y for v in coords)
             max_y = max(v.y for v in coords)
-
             size = Vector((max_x - min_x, max_y - min_y))
-
-            # Compute centroid of island UVs for rotation anchor
-            if coords:
-                centroid = Vector((0.0, 0.0))
-                for c in coords:
-                    centroid += c
-                centroid /= len(coords)
-            else:
-                centroid = Vector((min_x, min_y))
-            island_data.append({
+            centroid = Vector((0.0, 0.0))
+            for c in coords:
+                centroid += c
+            centroid /= len(coords)
+            data_list.append({
                 "uvs": uvs,
                 "coords": coords,
                 "min": Vector((min_x, min_y)),
                 "size": size,
-                "centroid": centroid
+                "centroid": centroid,
+                "obj": obj,
             })
+        return data_list, bm
 
-        # -----------------------------
-        # 3. Generate tiles (5x5)
-        # -----------------------------
+    def execute(self, context):
+        objects = [obj for obj in context.selected_objects
+                   if obj.type == 'MESH' and obj.mode == 'EDIT']
+        if not objects:
+            return {'CANCELLED'}
+
+        props = context.scene.cs2wd_props
+
+        tile_padding = 0.0
+        island_padding = 0.001
+
+        mode_label = "multi-object" if len(objects) > 1 else "single"
+        if DEBUG_TILE_SCALES:
+            print("cs2wd OBJECTS:", [o.name for o in objects])
+
+        # Collect islands from all selected objects
+        island_data = []
+        obj_bm_map = {}
+        for obj in objects:
+            data_list, bm = self._collect_island_data(obj)
+            island_data.extend(data_list)
+            obj_bm_map[obj] = bm
+
+        if not island_data:
+            return {'CANCELLED'}
+
+        # Tile grid
         cols = rows = 5
         tile_w = 1.0 / cols
         tile_h = 1.0 / rows
@@ -424,21 +395,14 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
                     "islands": []
                 })
 
-        # -----------------------------
-        # 4. Assign tiles to islands based on selections
-        # -----------------------------
         tile_indices = props.get_selected_tiles()
-        # Safety: ensure we have at least one tile to map islands to
         if not tile_indices:
             tile_indices = list(range(25))
-        # Apply exclude edges if active
         if props.exclude_edges:
             tile_indices = [i for i in tile_indices if i not in (0, 24)]
-            # If exclusion leaves no tiles, fall back to all non-edge tiles
             if not tile_indices:
                 tile_indices = [i for i in range(25) if i not in (0, 24)]
 
-        # Reset tile islands so each distribution recomputes scaling from scratch
         for t in tiles:
             t["islands"] = []
         random.shuffle(island_data)
@@ -446,71 +410,62 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
         for i, data in enumerate(island_data):
             tiles[tile_indices[i % len(tile_indices)]]["islands"].append(data)
 
-        # Compute global max island dimensions for consistent per-tile scaling
-        # across all tiles to ensure uniform island sizes
         global_max_w = 1.0
         global_max_h = 1.0
         if island_data:
             global_max_w = max(d["size"].x for d in island_data) or 1.0
             global_max_h = max(d["size"].y for d in island_data) or 1.0
 
-        # -----------------------------
-        # 5. Place islands per tile with PER-TILE UNIFORM SCALE
-        # -----------------------------
+        # Place islands
         for ti, tile in enumerate(tiles):
             islands_in_tile = tile["islands"]
             if not islands_in_tile:
                 continue
-
-            # Compute grid size (rows x cols) for this tile
             n = len(islands_in_tile)
             grid_cols = math.ceil(math.sqrt(n))
             grid_rows = math.ceil(n / grid_cols)
-
-            # Pre-compute tile cell size for this tile
             cell_w = (tile_w - 2 * tile_padding - (grid_cols - 1) * island_padding) / grid_cols
             cell_h = (tile_h - 2 * tile_padding - (grid_rows - 1) * island_padding) / grid_rows
-            # Step 2A: per tile mean scale (robust to outliers)
             tile_scale = _tile_mean_scale(islands_in_tile, cell_w, cell_h)
             if DEBUG_TILE_SCALES:
                 print(f"cs2wd DEBUG: tile {ti} n={n} cell_w={cell_w} cell_h={cell_h} tile_scale={tile_scale:.6f}")
-            # Orientation removed: no rotation; keep 2D centering only
 
             for idx, data in enumerate(islands_in_tile):
                 col = idx % grid_cols
                 row = idx // grid_cols
-
-                # Cell top-left position
                 cell_x = tile["pos"].x + tile_padding + col * (cell_w + island_padding)
                 cell_y = tile["pos"].y + tile_h - tile_padding - (row + 1) * cell_h - row * island_padding
-                # Bounds of the sub-cell area within this tile cell
                 subcell_min_x = cell_x
                 subcell_max_x = cell_x + cell_w
                 subcell_min_y = cell_y
                 subcell_max_y = cell_y + cell_h
 
-                # Fill each island cell by its own height/width, preserving aspect ratio
                 width = data["size"].x
                 height = data["size"].y
                 cell_w_eff = max(cell_w - 2 * island_padding, 0.0)
                 cell_h_eff = max(cell_h - 2 * island_padding, 0.0)
                 eps = 1e-8
                 scale_i = min(cell_w_eff / max(width, eps), cell_h_eff / max(height, eps), 1.0)
-                # Enforce tile-wide mean-based scale as an upper bound
                 scale_final = min(scale_i, tile_scale)
-
                 offset_i = Vector((
                     cell_x + (cell_w - width * scale_final) * 0.5 - data["min"].x * scale_final,
                     cell_y + (cell_h - height * scale_final) * 0.5 - data["min"].y * scale_final
                 ))
-
                 for uv, orig in zip(data["uvs"], data["coords"]):
                     uv.uv = orig * scale_final + offset_i
-                    # Clamp to the sub-cell bounds to avoid spilling outside tile space
                     uv.uv.x = max(min(uv.uv.x, subcell_max_x), subcell_min_x)
                     uv.uv.y = max(min(uv.uv.y, subcell_max_y), subcell_min_y)
 
-        bmesh.update_edit_mesh(obj.data)
+        # Update all objects
+        updated = set()
+        for obj in objects:
+            bm = obj_bm_map.get(obj)
+            if bm:
+                bmesh.update_edit_mesh(obj.data)
+                updated.add(obj.name)
+
+        if DEBUG_TILE_SCALES:
+            print(f"cs2wd DISTRIBUTE: distributed {len(island_data)} islands across {len(updated)} object(s)")
         return {'FINISHED'}
 
 # -----------------------------
