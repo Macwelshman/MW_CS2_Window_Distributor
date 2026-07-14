@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MW CS2 Window Distributor",
     "author": "Macwelshman",
-    "version": (2, 6, 0),
+    "version": (2, 7, 0),
     "blender": (3, 0, 0),
     "location": "UV Editor > Sidebar",
     "description": "Distribute windows across the CS2 window space.",
@@ -13,31 +13,45 @@ import bmesh
 import random
 from mathutils import Vector
 import math
-PATCH_STEP1_DUMMY = True
 
 from math import sin, cos, atan2
 
-# Blender 5.0 compatibility flag (best-effort, feature-detection-based)
-try:
-    _BLENDER_MAJOR = bpy.app.version[0]
-    IS_BLENDER_5 = _BLENDER_MAJOR >= 5
-except Exception:
-    IS_BLENDER_5 = False
-DEBUG_TILE_SCALES = True  # Set to True to print per-tile scale debugging information
-TILE_SCALE_CAP = 1.25
+DEBUG_TILE_SCALES = False
+UV_EPSILON = 1e-6
 
 # Residential mode tile sets (0-based indices)
 RESI_CUR_TILES = [2, 3, 5, 8, 9, 10, 11, 14, 16, 17, 22, 23]
 RESI_BLANK_TILES = [0, 1, 4, 6, 7, 12, 13, 15, 18, 19, 20, 21, 24]
 
-def _tile_mean_scale(islands, cell_w, cell_h):
-    """Return uniform scale for all islands in a tile based on mean island size."""
+def _tile_uniform_scale(islands, cell_w, cell_h, allow_upscale):
+    """Return one scale that fits every island in an identically sized cell."""
     if not islands:
         return 1.0
-    mean_w = sum(d["size"].x for d in islands) / len(islands)
-    mean_h = sum(d["size"].y for d in islands) / len(islands)
+    max_w = max(d["size"].x for d in islands)
+    max_h = max(d["size"].y for d in islands)
     eps = 1e-8
-    return min(cell_w / max(mean_w, eps), cell_h / max(mean_h, eps), 1.0)
+    scale = min(cell_w / max(max_w, eps), cell_h / max(max_h, eps))
+    return scale if allow_upscale else min(scale, 1.0)
+
+
+def _uv_edges_match(loop_a, loop_b, uv_layer):
+    """Return whether two loops on the same mesh edge are UV-continuous."""
+    a_start = loop_a[uv_layer].uv
+    a_end = loop_a.link_loop_next[uv_layer].uv
+    b_start = loop_b[uv_layer].uv
+    b_end = loop_b.link_loop_next[uv_layer].uv
+
+    if loop_a.vert == loop_b.vert:
+        return (a_start - b_start).length < UV_EPSILON and (a_end - b_end).length < UV_EPSILON
+    return (a_start - b_end).length < UV_EPSILON and (a_end - b_start).length < UV_EPSILON
+
+
+def _connected_uv_faces(face, uv_layer):
+    """Yield faces joined to *face* across UV-continuous shared edges."""
+    for loop in face.loops:
+        for linked in loop.edge.link_loops:
+            if linked.face != face and _uv_edges_match(loop, linked, uv_layer):
+                yield linked.face
 
 # -----------------------------
 # World Orientation Helpers
@@ -173,12 +187,9 @@ def _get_uv_islands(bm, uv_layer):
                 continue
             visited_faces.add(f)
             island.append(f)
-            for loop in f.loops:
-                for linked in loop.vert.link_loops:
-                    if linked.face in visited_faces:
-                        continue
-                    if (loop[uv_layer].uv - linked[uv_layer].uv).length < 1e-6:
-                        stack.append(linked.face)
+            for linked_face in _connected_uv_faces(f, uv_layer):
+                if linked_face not in visited_faces:
+                    stack.append(linked_face)
         if island:
             islands.append(island)
     return islands
@@ -233,6 +244,43 @@ class CS2WDProperties(bpy.types.PropertyGroup):
         ],
         default="commercial",
         description="Choose distribution mode"
+    )
+
+    tile_padding: bpy.props.FloatProperty(
+        name="Tile Padding",
+        default=0.0,
+        min=0.0,
+        max=0.05,
+        subtype='FACTOR',
+        description="Padding around the edge of every CS2 tile"
+    )
+
+    island_padding: bpy.props.FloatProperty(
+        name="Island Padding",
+        default=0.001,
+        min=0.0,
+        max=0.05,
+        subtype='FACTOR',
+        description="Padding between UV islands within a tile"
+    )
+
+    randomize_distribution: bpy.props.BoolProperty(
+        name="Randomize Distribution",
+        default=False,
+        description="Randomly assign islands to available tiles using the seed below"
+    )
+
+    random_seed: bpy.props.IntProperty(
+        name="Seed",
+        default=0,
+        min=0,
+        description="Seed used when randomizing distribution"
+    )
+
+    allow_upscale: bpy.props.BoolProperty(
+        name="Allow Upscale",
+        default=False,
+        description="Allow islands to be enlarged to fill their grid cells"
     )
     
     def validate_window_selection(self):
@@ -298,15 +346,23 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
                     pass
         return False
 
-    def _collect_island_data(self, obj):
+    def _collect_island_data(self, obj, use_uv_sync):
         bm = bmesh.from_edit_mesh(obj.data)
         uv_layer = bm.loops.layers.uv.verify()
         bm.faces.ensure_lookup_table()
 
         islands = []
         visited = set()
-        selected_faces = [f for f in bm.faces if f.select]
-        faces_to_process = selected_faces if selected_faces else bm.faces
+        if use_uv_sync:
+            faces_to_process = [f for f in bm.faces if f.select]
+        else:
+            faces_to_process = [
+                f for f in bm.faces
+                if all(loop[uv_layer].select for loop in f.loops)
+            ]
+
+        if not faces_to_process:
+            return [], bm
 
         for face in faces_to_process:
             if face in visited:
@@ -319,12 +375,9 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
                     continue
                 island.add(f)
                 visited.add(f)
-                for loop in f.loops:
-                    for linked in loop.vert.link_loops:
-                        if linked.face in island:
-                            continue
-                        if (loop[uv_layer].uv - linked[uv_layer].uv).length < 1e-6:
-                            stack.append(linked.face)
+                for linked_face in _connected_uv_faces(f, uv_layer):
+                    if linked_face not in island:
+                        stack.append(linked_face)
             islands.append(island)
 
         data_list = []
@@ -364,8 +417,8 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
 
         props = context.scene.cs2wd_props
 
-        tile_padding = 0.0
-        island_padding = 0.001
+        tile_padding = props.tile_padding
+        island_padding = props.island_padding
 
         mode_label = "multi-object" if len(objects) > 1 else "single"
         if DEBUG_TILE_SCALES:
@@ -375,11 +428,14 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
         island_data = []
         obj_bm_map = {}
         for obj in objects:
-            data_list, bm = self._collect_island_data(obj)
+            data_list, bm = self._collect_island_data(
+                obj, context.tool_settings.use_uv_select_sync
+            )
             island_data.extend(data_list)
             obj_bm_map[obj] = bm
 
         if not island_data:
+            self.report({'WARNING'}, "Select one or more UV islands")
             return {'CANCELLED'}
 
         # Tile grid
@@ -405,16 +461,13 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
 
         for t in tiles:
             t["islands"] = []
-        random.shuffle(island_data)
+        # Stable order makes repeated runs reproducible.  Randomization is opt-in.
+        island_data.sort(key=lambda data: (data["obj"].name, data["min"].y, data["min"].x))
+        if props.randomize_distribution:
+            random.Random(props.random_seed).shuffle(island_data)
 
         for i, data in enumerate(island_data):
             tiles[tile_indices[i % len(tile_indices)]]["islands"].append(data)
-
-        global_max_w = 1.0
-        global_max_h = 1.0
-        if island_data:
-            global_max_w = max(d["size"].x for d in island_data) or 1.0
-            global_max_h = max(d["size"].y for d in island_data) or 1.0
 
         # Place islands
         for ti, tile in enumerate(tiles):
@@ -426,7 +479,11 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
             grid_rows = math.ceil(n / grid_cols)
             cell_w = (tile_w - 2 * tile_padding - (grid_cols - 1) * island_padding) / grid_cols
             cell_h = (tile_h - 2 * tile_padding - (grid_rows - 1) * island_padding) / grid_rows
-            tile_scale = _tile_mean_scale(islands_in_tile, cell_w, cell_h)
+            cell_w_eff = max(cell_w - 2 * island_padding, 0.0)
+            cell_h_eff = max(cell_h - 2 * island_padding, 0.0)
+            tile_scale = _tile_uniform_scale(
+                islands_in_tile, cell_w_eff, cell_h_eff, props.allow_upscale
+            )
             if DEBUG_TILE_SCALES:
                 print(f"cs2wd DEBUG: tile {ti} n={n} cell_w={cell_w} cell_h={cell_h} tile_scale={tile_scale:.6f}")
 
@@ -435,26 +492,15 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
                 row = idx // grid_cols
                 cell_x = tile["pos"].x + tile_padding + col * (cell_w + island_padding)
                 cell_y = tile["pos"].y + tile_h - tile_padding - (row + 1) * cell_h - row * island_padding
-                subcell_min_x = cell_x
-                subcell_max_x = cell_x + cell_w
-                subcell_min_y = cell_y
-                subcell_max_y = cell_y + cell_h
-
                 width = data["size"].x
                 height = data["size"].y
-                cell_w_eff = max(cell_w - 2 * island_padding, 0.0)
-                cell_h_eff = max(cell_h - 2 * island_padding, 0.0)
-                eps = 1e-8
-                scale_i = min(cell_w_eff / max(width, eps), cell_h_eff / max(height, eps), 1.0)
-                scale_final = min(scale_i, tile_scale)
+                scale_final = tile_scale
                 offset_i = Vector((
                     cell_x + (cell_w - width * scale_final) * 0.5 - data["min"].x * scale_final,
                     cell_y + (cell_h - height * scale_final) * 0.5 - data["min"].y * scale_final
                 ))
                 for uv, orig in zip(data["uvs"], data["coords"]):
                     uv.uv = orig * scale_final + offset_i
-                    uv.uv.x = max(min(uv.uv.x, subcell_max_x), subcell_min_x)
-                    uv.uv.y = max(min(uv.uv.y, subcell_max_y), subcell_min_y)
 
         # Update all objects
         updated = set()
@@ -490,7 +536,10 @@ class CS2WD_OT_WorldOrient(bpy.types.Operator):
         bm.faces.ensure_lookup_table()
         matrix = obj.matrix_world
 
-        selected_faces = _get_selected_faces(bm, uv_layer)
+        if context.tool_settings.use_uv_select_sync:
+            selected_faces = [face for face in bm.faces if face.select]
+        else:
+            selected_faces = _get_selected_faces(bm, uv_layer)
         if not selected_faces:
             self.report({'WARNING'}, "No UV islands selected")
             return {'CANCELLED'}
@@ -533,6 +582,14 @@ class CS2WD_PT_MainPanel(bpy.types.Panel):
         else:
             layout.prop(props, "curtains")
             layout.prop(props, "use_specific_tiles")
+        layout.separator()
+        layout.label(text="Packing")
+        layout.prop(props, "tile_padding")
+        layout.prop(props, "island_padding")
+        layout.prop(props, "allow_upscale")
+        layout.prop(props, "randomize_distribution")
+        if props.randomize_distribution:
+            layout.prop(props, "random_seed")
         layout.separator()
         # Orientate UVs button
         row = layout.row(align=True)
