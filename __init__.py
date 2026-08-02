@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MW CS2 Window Distributor",
     "author": "Macwelshman",
-    "version": (2, 7, 0),
+    "version": (2, 7, 2),
     "blender": (3, 0, 0),
     "location": "UV Editor > Sidebar",
     "description": "Distribute windows across the CS2 window space.",
@@ -53,19 +53,96 @@ def _connected_uv_faces(face, uv_layer):
             if linked.face != face and _uv_edges_match(loop, linked, uv_layer):
                 yield linked.face
 
+
+def _edit_mesh_objects(context):
+    """Return mesh objects in Edit Mode from any editor context."""
+    objects = list(getattr(context, "objects_in_mode_unique_data", ()) or ())
+    if not objects:
+        objects = list(getattr(context, "selected_objects", ()) or ())
+
+    edit_object = getattr(context, "edit_object", None)
+    if edit_object and edit_object not in objects:
+        objects.append(edit_object)
+
+    return [
+        obj for obj in objects
+        if obj.type == 'MESH' and obj.mode == 'EDIT'
+    ]
+
+
 # -----------------------------
 # World Orientation Helpers
 # -----------------------------
-def _get_selected_faces(bm, uv_layer):
+def _bmesh_has_uv_selection(bm, uv_layer):
+    """Return whether this Blender version exposes UV selection on BMLoopUV."""
+    for face in bm.faces:
+        if face.loops:
+            return hasattr(face.loops[0][uv_layer], "select")
+    return True
+
+
+def _snapshot_uv_face_selection(context, objects):
+    """Return selected UV face indices when BMLoopUV.select is unavailable.
+
+    Blender 5.2 stores UV selection in mesh attributes that are only exposed
+    through Python outside Edit Mode. Temporarily leaving and restoring Edit
+    Mode commits those attributes without changing the user's selection.
+    """
+    needs_snapshot = False
+    for obj in objects:
+        bm = bmesh.from_edit_mesh(obj.data)
+        uv_layer = bm.loops.layers.uv.verify()
+        bm.faces.ensure_lookup_table()
+        if not _bmesh_has_uv_selection(bm, uv_layer):
+            needs_snapshot = True
+            break
+
+    if not needs_snapshot:
+        return {}
+
+    active = context.view_layer.objects.active
+    snapshots = {}
+    bpy.ops.object.mode_set(mode='OBJECT')
+    try:
+        for obj in objects:
+            mesh = obj.data
+            vert_selection = mesh.attributes.get(".uv_select_vert")
+            face_selection = mesh.attributes.get(".uv_select_face")
+            selected = set()
+
+            if vert_selection:
+                for polygon in mesh.polygons:
+                    if all(vert_selection.data[i].value for i in polygon.loop_indices):
+                        selected.add(polygon.index)
+            elif face_selection:
+                selected.update(
+                    polygon.index
+                    for polygon in mesh.polygons
+                    if face_selection.data[polygon.index].value
+                )
+            else:
+                selected.update(polygon.index for polygon in mesh.polygons if polygon.select)
+
+            snapshots[obj] = selected
+    finally:
+        if active:
+            context.view_layer.objects.active = active
+        bpy.ops.object.mode_set(mode='EDIT')
+
+    return snapshots
+
+
+def _get_selected_faces(bm, uv_layer, selected_face_indices=None):
     selected = []
     for f in bm.faces:
         if not f.select:
             continue
-        try:
+        if selected_face_indices is not None:
+            if f.index not in selected_face_indices:
+                continue
+        else:
             if not all(loop[uv_layer].select for loop in f.loops):
                 continue
-        except AttributeError:
-            pass
         selected.append(f)
     return selected
 
@@ -333,20 +410,13 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
     bl_idname = "cs2wd.distribute_uv"
     bl_label = "Distribute"
     bl_options = {'REGISTER', 'UNDO'}
-    bl_description = "Select one or more decoration types"
+    bl_description = "Distribute selected UV islands across the chosen CS2 window tiles"
 
     @classmethod
     def poll(cls, context):
-        if any(obj.type == 'MESH' for obj in context.selected_objects if obj.mode == 'EDIT'):
-            props = getattr(context.scene, 'cs2wd_props', None)
-            if props:
-                try:
-                    return bool(props.validate_window_selection())
-                except Exception:
-                    pass
-        return False
+        return bool(_edit_mesh_objects(context))
 
-    def _collect_island_data(self, obj, use_uv_sync):
+    def _collect_island_data(self, obj, use_uv_sync, selected_face_indices=None):
         bm = bmesh.from_edit_mesh(obj.data)
         uv_layer = bm.loops.layers.uv.verify()
         bm.faces.ensure_lookup_table()
@@ -355,6 +425,11 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
         visited = set()
         if use_uv_sync:
             faces_to_process = [f for f in bm.faces if f.select]
+        elif selected_face_indices is not None:
+            faces_to_process = [
+                f for f in bm.faces
+                if f.index in selected_face_indices
+            ]
         else:
             faces_to_process = [
                 f for f in bm.faces
@@ -410,12 +485,16 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
         return data_list, bm
 
     def execute(self, context):
-        objects = [obj for obj in context.selected_objects
-                   if obj.type == 'MESH' and obj.mode == 'EDIT']
+        objects = _edit_mesh_objects(context)
         if not objects:
             return {'CANCELLED'}
 
         props = context.scene.cs2wd_props
+        selected_uv_faces = (
+            {}
+            if context.tool_settings.use_uv_select_sync
+            else _snapshot_uv_face_selection(context, objects)
+        )
 
         tile_padding = props.tile_padding
         island_padding = props.island_padding
@@ -429,7 +508,9 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
         obj_bm_map = {}
         for obj in objects:
             data_list, bm = self._collect_island_data(
-                obj, context.tool_settings.use_uv_select_sync
+                obj,
+                context.tool_settings.use_uv_select_sync,
+                selected_uv_faces.get(obj),
             )
             island_data.extend(data_list)
             obj_bm_map[obj] = bm
@@ -530,6 +611,11 @@ class CS2WD_OT_WorldOrient(bpy.types.Operator):
 
     def execute(self, context):
         obj = context.object
+        selected_uv_faces = (
+            {}
+            if context.tool_settings.use_uv_select_sync
+            else _snapshot_uv_face_selection(context, [obj])
+        )
         me = obj.data
         bm = bmesh.from_edit_mesh(me)
         uv_layer = bm.loops.layers.uv.verify()
@@ -539,7 +625,9 @@ class CS2WD_OT_WorldOrient(bpy.types.Operator):
         if context.tool_settings.use_uv_select_sync:
             selected_faces = [face for face in bm.faces if face.select]
         else:
-            selected_faces = _get_selected_faces(bm, uv_layer)
+            selected_faces = _get_selected_faces(
+                bm, uv_layer, selected_uv_faces.get(obj)
+            )
         if not selected_faces:
             self.report({'WARNING'}, "No UV islands selected")
             return {'CANCELLED'}
