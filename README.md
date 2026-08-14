@@ -25,9 +25,21 @@ The add-on places selected UV islands into predefined commercial or residential 
 - A mesh with an existing UV map
 - Window UV islands prepared for placement within the CS2 window atlas
 
-The current source version is **2.7.2**.
+The current source version is **2.7.3**.
 
 ## Installation
+
+### Install from the MW Blender Extensions repository
+
+1. Open **Edit → Preferences → Get Extensions**.
+2. Open the repositories menu and add:
+   `https://raw.githubusercontent.com/Macwelshman/MW-Blender-Extensions/main/index.json`
+3. Sync the repository.
+4. Search for **MW CS2 Window Distributor** and click **Install**.
+
+Blender will offer future published versions through **Check for Updates**. If
+you previously installed the legacy ZIP, remove it once and reinstall from the
+MW repository so Blender can manage subsequent updates.
 
 ### Install the packaged add-on
 
@@ -42,9 +54,9 @@ Do not extract the installation ZIP before installing it through Blender.
 
 ### Install from the source folder
 
-1. Place `__init__.py` inside a folder named `MW_CS2_Window_Distributor`.
-2. Compress that folder as a ZIP.
-3. Install the ZIP through **Edit → Preferences → Add-ons → Install from Disk**.
+Build the Extension package from the repository root so `__init__.py` and
+`blender_manifest.toml` are both at the ZIP root, then install it through
+**Edit → Preferences → Get Extensions → Install from Disk**.
 
 ## Location
 
@@ -243,17 +255,15 @@ Increase **Tile Padding** slightly. Final requirements depend on the atlas resol
 
 ## Updating
 
-1. Download the newer add-on ZIP.
-2. Open **Edit → Preferences → Add-ons**.
-3. Disable or remove the old version if necessary.
-4. Install the new ZIP through **Install from Disk**.
-5. Restart Blender if the old code remains loaded.
+Repository installations use Blender's normal **Check for Updates** workflow.
+Manual installations must be replaced with the newer release ZIP.
 
-The version installed from the current source should appear as **2.7.2**.
+The version installed from the current source should appear as **2.7.3**.
 
 ## Development
 
-The add-on is contained in a single `__init__.py` file for straightforward Blender installation.
+The add-on implementation remains in a single `__init__.py` file. Extension
+metadata is declared separately in `blender_manifest.toml`.
 
 A basic syntax check can be run from the repository root with:
 
@@ -266,12 +276,11 @@ python3 -B -c "import ast, pathlib; ast.parse(pathlib.Path('__init__.py').read_t
 ```text
 MW_CS2_Window_Distributor/
 ├── __init__.py
+├── blender_manifest.toml
 ├── README.md
 └── dist/
-    └── MW_CS2_Window_Distributor-2.7.0.zip
+    └── mw_cs2_window_distributor-2.7.3.zip
 ```
-
-The packaged ZIP in `dist` may be older than the version declared by the current source. Rebuild the release package before publishing a new release.
 
 ## Disclaimer
 

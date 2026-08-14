@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MW CS2 Window Distributor",
     "author": "Macwelshman",
-    "version": (2, 7, 2),
+    "version": (2, 7, 3),
     "blender": (3, 0, 0),
     "location": "UV Editor > Sidebar",
     "description": "Distribute windows across the CS2 window space.",
