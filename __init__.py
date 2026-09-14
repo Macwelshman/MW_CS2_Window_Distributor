@@ -1,8 +1,8 @@
 bl_info = {
     "name": "MW CS2 Window Distributor",
     "author": "Macwelshman",
-    "version": (2, 7, 3),
-    "blender": (3, 0, 0),
+    "version": (2, 7, 5),
+    "blender": (5, 2, 0),
     "location": "UV Editor > Sidebar",
     "description": "Distribute windows across the CS2 window space.",
     "category": "UV",
@@ -20,7 +20,8 @@ DEBUG_TILE_SCALES = False
 UV_EPSILON = 1e-6
 
 # Residential mode tile sets (0-based indices)
-RESI_CUR_TILES = [2, 3, 5, 8, 9, 10, 11, 14, 16, 17, 22, 23]
+RESI_CUR_TILES = [2, 8, 10, 14, 16, 22]
+RESI_CUR_CLOSED_TILES = [3, 5, 9, 11, 17, 23]
 RESI_BLANK_TILES = [0, 1, 4, 6, 7, 12, 13, 15, 18, 19, 20, 21, 24]
 
 def _tile_uniform_scale(islands, cell_w, cell_h, allow_upscale):
@@ -120,8 +121,8 @@ def _snapshot_uv_face_selection(context, objects):
                     for polygon in mesh.polygons
                     if face_selection.data[polygon.index].value
                 )
-            else:
-                selected.update(polygon.index for polygon in mesh.polygons if polygon.select)
+            # Missing UV selection attributes mean no UV selection, not all
+            # mesh-selected faces (which may only be visible in the UV editor).
 
             snapshots[obj] = selected
     finally:
@@ -155,15 +156,52 @@ def _island_center(faces, uv_layer):
             count += 1
     return total / count if count else Vector((0.0, 0.0))
 
-def _world_orient_island(faces, uv_layer, matrix):
-    avg_normal = Vector((0.0, 0.0, 0.0))
-    for f in faces:
-        world_n = (matrix.to_3x3() @ f.normal).normalized()
-        avg_normal += world_n
-    avg_normal /= len(faces)
-    if avg_normal.length < 1e-8:
-        return
-    avg_normal.normalize()
+def _world_normal_transform(matrix):
+    """Transform oriented area vectors, including reflected face winding."""
+    linear = matrix.to_3x3()
+    # Do not silently substitute an identity transform for zero-scale objects.
+    normal_matrix = linear.inverted().transposed()
+    return normal_matrix * linear.determinant()
+
+
+def _island_world_normal(faces, normal_matrix):
+    """Return a world-area-weighted normal, or None for unusable geometry."""
+    normal_sum = Vector((0.0, 0.0, 0.0))
+    total_area = 0.0
+    for face in faces:
+        # The cofactor transform maps local oriented area to world area.
+        area_vector = normal_matrix @ (face.normal * face.calc_area())
+        area = area_vector.length
+        if not math.isfinite(area):
+            return None
+        normal_sum += area_vector
+        total_area += area
+    if total_area == 0.0 or normal_sum.length <= total_area * 1e-8:
+        return None
+    return normal_sum.normalized()
+
+
+def _weighted_orientation_angle(angles):
+    """Circular mean; reject directions whose weighted agreement is negligible."""
+    if not angles:
+        return None, "no usable edges"
+    total_weight = math.fsum(weight for _, weight in angles)
+    sine = math.fsum(sin(angle) * weight for angle, weight in angles)
+    cosine = math.fsum(cos(angle) * weight for angle, weight in angles)
+    if not all(math.isfinite(value) for value in (total_weight, sine, cosine)):
+        return None, "invalid edge directions"
+    if total_weight <= 0.0:
+        return None, "no usable edges"
+    # Scale-independent cancellation tolerance, not an artistic angle cutoff.
+    if math.hypot(sine, cosine) <= total_weight * 1e-6:
+        return None, "ambiguous orientation"
+    return atan2(sine, cosine), None
+
+
+def _world_orient_island(faces, uv_layer, matrix, normal_matrix):
+    avg_normal = _island_world_normal(faces, normal_matrix)
+    if avg_normal is None:
+        return "SKIPPED", "unusable surface normal"
 
     abs_n = Vector((abs(avg_normal.x), abs(avg_normal.y), abs(avg_normal.z)))
 
@@ -180,28 +218,16 @@ def _world_orient_island(faces, uv_layer, matrix):
         flip_x = avg_normal.x < 0
         flip_y = False
 
-    island_loops = {loop for f in faces for loop in f.loops}
-    island_edges = {edge for f in faces for edge in f.edges}
-
+    # Visit one representative per edge in mesh order, independent of sets.
+    seen_edges = set()
     calc_loops = []
-    for edge in island_edges:
-        uv_pairs = []
-        for vert in edge.verts:
-            for loop in vert.link_loops:
-                if loop in island_loops:
-                    uv_pairs.append(loop[uv_layer].uv.to_tuple(5))
-                    break
-        if len(set(uv_pairs)) == 2:
-            for loop in edge.link_loops:
-                if loop in island_loops:
-                    calc_loops.append(loop)
-                    break
+    for face in sorted(faces, key=lambda face: face.index):
+        for loop in face.loops:
+            if loop.edge not in seen_edges:
+                seen_edges.add(loop.edge)
+                calc_loops.append(loop)
 
-    if not calc_loops:
-        calc_loops = list(island_loops)
-
-    total_weight = 0.0
-    avg_angle = 0.0
+    angles = []
     for loop in calc_loops:
         co0 = matrix @ loop.vert.co
         co1 = matrix @ loop.link_loop_next.vert.co
@@ -227,17 +253,13 @@ def _world_orient_island(faces, uv_layer, matrix):
 
         weight = proj_len * uv_len
 
-        if total_weight == 0.0:
-            avg_angle = a_delta
-            total_weight = weight
-        else:
-            diff = a_delta - avg_angle
-            diff = atan2(sin(diff), cos(diff))
-            avg_angle += diff * (weight / (total_weight + weight))
-            total_weight += weight
+        angles.append((a_delta, weight))
 
-    if total_weight == 0.0:
-        return
+    avg_angle, reason = _weighted_orientation_angle(angles)
+    if avg_angle is None:
+        return "SKIPPED", reason
+    if abs(avg_angle) <= 1e-6:
+        return "ALIGNED", None
 
     if abs(avg_angle) > 1e-6:
         center = _island_center(faces, uv_layer)
@@ -249,6 +271,7 @@ def _world_orient_island(faces, uv_layer, matrix):
                 dy = uv.y - center.y
                 uv.x = center.x + dx * ca - dy * sa
                 uv.y = center.y + dx * sa + dy * ca
+    return "ROTATED", None
 
 def _get_uv_islands(bm, uv_layer):
     islands = []
@@ -290,9 +313,15 @@ class CS2WDProperties(bpy.types.PropertyGroup):
     )
 
     curtains: bpy.props.BoolProperty(
-        name="Curtains",
+        name="Curtains (Open)",
         default=False,
-        description="Windows with curtains"
+        description="Windows with open curtains"
+    )
+
+    curtains_closed: bpy.props.BoolProperty(
+        name="Curtains (Closed)",
+        default=False,
+        description="Windows with closed curtains"
     )
     
     blinds_vertical: bpy.props.BoolProperty(
@@ -316,8 +345,8 @@ class CS2WDProperties(bpy.types.PropertyGroup):
     mode: bpy.props.EnumProperty(
         name="Mode",
         items=[
-            ("commercial", "Commercial", "Uses current window-type options"),
-            ("residential", "Residential", "Blinds/Blank tile sets"),
+            ("commercial", "Non-Residential", "Uses current window-type options"),
+            ("residential", "Residential", "Open curtains, closed curtains and blank tile sets"),
         ],
         default="commercial",
         description="Choose distribution mode"
@@ -372,6 +401,7 @@ class CS2WDProperties(bpy.types.PropertyGroup):
         else:  # residential mode
             selected_count = sum([
                 self.curtains,
+                self.curtains_closed,
                 self.use_specific_tiles
             ])
         # Require at least one active option for the chosen mode
@@ -393,10 +423,12 @@ class CS2WDProperties(bpy.types.PropertyGroup):
                 return list(range(25))
             return sorted(tiles)
         else:
-            # Residential mode uses Curtains + Blank presets
+            # Residential presets use the atlas's exact numbered tile sets.
             tiles = set()
             if self.curtains:
                 tiles.update(RESI_CUR_TILES)
+            if self.curtains_closed:
+                tiles.update(RESI_CUR_CLOSED_TILES)
             if self.use_specific_tiles:
                 tiles.update(RESI_BLANK_TILES)
             if not tiles:
@@ -424,21 +456,17 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
         islands = []
         visited = set()
         if use_uv_sync:
-            faces_to_process = [f for f in bm.faces if f.select]
-        elif selected_face_indices is not None:
-            faces_to_process = [
-                f for f in bm.faces
-                if f.index in selected_face_indices
-            ]
+            faces_to_process = [f for f in bm.faces if f.select and not f.hide]
         else:
             faces_to_process = [
-                f for f in bm.faces
-                if all(loop[uv_layer].select for loop in f.loops)
+                f for f in _get_selected_faces(bm, uv_layer, selected_face_indices)
+                if not f.hide
             ]
 
         if not faces_to_process:
             return [], bm
 
+        selected_faces = set(faces_to_process)
         for face in faces_to_process:
             if face in visited:
                 continue
@@ -451,7 +479,7 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
                 island.add(f)
                 visited.add(f)
                 for linked_face in _connected_uv_faces(f, uv_layer):
-                    if linked_face not in island:
+                    if linked_face in selected_faces and linked_face not in island:
                         stack.append(linked_face)
             islands.append(island)
 
@@ -621,6 +649,11 @@ class CS2WD_OT_WorldOrient(bpy.types.Operator):
         uv_layer = bm.loops.layers.uv.verify()
         bm.faces.ensure_lookup_table()
         matrix = obj.matrix_world
+        try:
+            normal_matrix = _world_normal_transform(matrix)
+        except ValueError:
+            self.report({'WARNING'}, "Cannot orient UVs: object transform has zero scale")
+            return {'CANCELLED'}
 
         if context.tool_settings.use_uv_select_sync:
             selected_faces = [face for face in bm.faces if face.select]
@@ -633,15 +666,27 @@ class CS2WD_OT_WorldOrient(bpy.types.Operator):
             return {'CANCELLED'}
 
         islands = _get_uv_islands(bm, uv_layer)
-        processed = 0
+        counts = {"ROTATED": 0, "ALIGNED": 0, "SKIPPED": 0}
+        reasons = {}
+        selected_faces = set(selected_faces)
         for island in islands:
             if any(f in selected_faces for f in island):
-                _world_orient_island(island, uv_layer, matrix)
-                processed += 1
+                outcome, reason = _world_orient_island(island, uv_layer, matrix, normal_matrix)
+                counts[outcome] += 1
+                if reason:
+                    reasons[reason] = reasons.get(reason, 0) + 1
 
-        bmesh.update_edit_mesh(me)
-        self.report({'INFO'}, f"World oriented {processed} island(s)")
-        return {'FINISHED'}
+        if counts["ROTATED"]:
+            bmesh.update_edit_mesh(me)
+        successful = counts["ROTATED"] + counts["ALIGNED"]
+        message = (f"Rotated {counts['ROTATED']} island(s); "
+                   f"{counts['ALIGNED']} already aligned; skipped {counts['SKIPPED']}")
+        if reasons:
+            message += " (" + "; ".join(
+                f"{count} {reason}" for reason, count in sorted(reasons.items())
+            ) + ")"
+        self.report({'INFO'} if successful else {'WARNING'}, message)
+        return {'FINISHED'} if successful else {'CANCELLED'}
 
 # -----------------------------
 # Main Panel
@@ -669,6 +714,7 @@ class CS2WD_PT_MainPanel(bpy.types.Panel):
             layout.prop(props, "use_specific_tiles")
         else:
             layout.prop(props, "curtains")
+            layout.prop(props, "curtains_closed")
             layout.prop(props, "use_specific_tiles")
         layout.separator()
         layout.label(text="Packing")

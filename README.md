@@ -2,12 +2,12 @@
 
 A Blender UV Editor add-on for distributing window UV islands across the **5 × 5 window texture atlas used by Cities: Skylines II**.
 
-The add-on places selected UV islands into predefined commercial or residential window tiles, keeps distribution repeatable by default, and provides controls for padding, scaling, randomisation, and world-aligned UV orientation.
+The add-on places selected UV islands into predefined non-residential or residential window tiles, keeps distribution repeatable by default, and provides controls for padding, scaling, randomisation, and world-aligned UV orientation.
 
 ## Features
 
 - Distributes selected UV islands across a 5 × 5 CS2 window atlas.
-- Commercial and residential window presets.
+- Non-Residential and residential window presets.
 - Supports one or more mesh objects in Edit Mode.
 - Preserves each island's aspect ratio.
 - Uses a consistent scale for all islands placed within the same tile.
@@ -21,11 +21,11 @@ The add-on places selected UV islands into predefined commercial or residential 
 
 ## Requirements
 
-- **Blender 3.0 or later**
+- **Blender 5.2 or later**
 - A mesh with an existing UV map
 - Window UV islands prepared for placement within the CS2 window atlas
 
-The current source version is **2.7.3**.
+The current source version is **2.7.5**.
 
 ## Installation
 
@@ -74,7 +74,7 @@ UV Editor → Sidebar → MW CS2 Win Dist
 2. Enter **Edit Mode**.
 3. Select the UV islands you want to distribute.
 4. Open the **MW CS2 Win Dist** panel in the UV Editor sidebar.
-5. Choose **Commercial** or **Residential** mode.
+5. Choose **Non-Residential** or **Residential** mode.
 6. Enable one or more window categories.
 7. Adjust the packing options when needed.
 8. Click **Distribute**.
@@ -87,19 +87,21 @@ The add-on works with **UV Sync Selection** either enabled or disabled.
 
 ### UV Sync Selection enabled
 
-Select the relevant mesh faces in Edit Mode. Their UV islands will be processed.
+Select the relevant mesh faces in Edit Mode. Only those selected faces will be distributed.
 
 ### UV Sync Selection disabled
 
 Select the complete UV island in the UV Editor. All UV vertices belonging to each face should be selected.
 
+Unselected faces stay unchanged, including faces connected to selected UVs. To make a second pass, deselect all UVs, select only the windows to change, switch the enabled window categories, then click **Distribute** again. For example, distribute Curtains first, then select a few windows and run a Blank-only pass.
+
 If Blender reports **Select one or more UV islands**, check that the full islands are selected rather than only individual UV vertices or edges.
 
 ## Distribution modes
 
-### Commercial
+### Non-Residential
 
-Commercial mode provides four tile groups:
+Non-Residential mode provides four tile groups:
 
 - **Blinds (Vertical)**
 - **Blinds (Open)**
@@ -112,10 +114,11 @@ You can enable several groups together. The add-on distributes islands across th
 
 Residential mode provides:
 
-- **Curtains**
-- **Blank**
+- **Curtains (Open)**: tiles 3, 9, 11, 15, 17 and 23.
+- **Curtains (Closed)**: tiles 4, 6, 10, 12, 18 and 24.
+- **Blank**: tiles 1, 2, 5, 7, 8, 13, 14, 16, 19, 20, 21, 22 and 25.
 
-Enable one or both groups to choose the residential tiles available for distribution.
+Enable one or more groups to combine their tile sets. Tile numbering runs left to right, starting at the top-left. **Exclude Always On/Off** removes tiles 1 and 25 in either mode when enabled.
 
 ## Controls
 
@@ -166,12 +169,12 @@ The **Orientate UVs** button rotates selected islands to follow the world orient
 This can help keep windows consistently upright across differently oriented walls.
 
 1. Select the islands or corresponding mesh faces.
-2. Apply the object's rotation and scale when appropriate.
+2. Object rotation and non-zero scale can remain unapplied.
 3. Click **Orientate UVs**.
 4. Inspect the result in the UV Editor.
 5. Click **Distribute** when ready.
 
-The operator evaluates the average world-space normal and weighted edge directions of each selected island. Unusual, curved, or irregular geometry may still require manual adjustment.
+The operator uses world-area-weighted surface normals and a weighted circular average of edge directions. It reports rotated, already aligned, and skipped islands separately, including reasons for skipping. Conflicting directions and unusable geometry are left unchanged; zero-scale transforms are rejected. Unusual, curved, or irregular geometry may still require manual adjustment. Orient islands before distributing them: rotation after packing can move UVs beyond their tile.
 
 ## Multi-object workflow
 
@@ -203,7 +206,7 @@ Because one scale is used per tile, smaller islands may not fill their cells as 
 2. Create and check the object's UV map.
 3. Separate window faces into clean UV islands.
 4. Use **Orientate UVs** to align selected windows.
-5. Choose the required commercial or residential window groups.
+5. Choose the required non-residential or residential window groups.
 6. Start with low padding values.
 7. Run **Distribute**.
 8. Check the atlas placement and texture preview.
@@ -258,7 +261,7 @@ Increase **Tile Padding** slightly. Final requirements depend on the atlas resol
 Repository installations use Blender's normal **Check for Updates** workflow.
 Manual installations must be replaced with the newer release ZIP.
 
-The version installed from the current source should appear as **2.7.3**.
+The version installed from the current source should appear as **2.7.5**.
 
 ## Development
 
@@ -279,7 +282,7 @@ MW_CS2_Window_Distributor/
 ├── blender_manifest.toml
 ├── README.md
 └── dist/
-    └── mw_cs2_window_distributor-2.7.3.zip
+    └── mw_cs2_window_distributor-2.7.5.zip
 ```
 
 ## Disclaimer
@@ -287,3 +290,11 @@ MW_CS2_Window_Distributor/
 This is an independent community tool and is not affiliated with or endorsed by **Iceflake Studios** or **Paradox Interactive**.
 
 Cities: Skylines II and its associated names and trademarks belong to their respective owners.
+
+## Version 2.7.5
+
+- Selected-only distribution preserves unselected connected UV faces.
+- Separate residential open and closed curtain presets.
+- Non-Residential mode label; exclusion of tiles 1 and 25 remains available in both modes.
+- World-space UV orientation fixes and Blender 5.2 compatibility.
+- Updated [user guide](docs/USER_GUIDE.md) and [PDF guide](docs/MW_CS2_Window_Distributor_Guide.pdf).

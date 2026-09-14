@@ -1,13 +1,13 @@
 schema_version = "1.0.0"
 
 id = "mw_cs2_window_distributor"
-version = "2.7.3"
+version = "2.7.5"
 name = "MW CS2 Window Distributor"
 tagline = "Distribute window UV islands across the CS2 window atlas"
 maintainer = "MacWelshman"
 type = "add-on"
 
-blender_version_min = "4.2.0"
+blender_version_min = "5.2.0"
 license = ["SPDX:GPL-3.0-or-later"]
 
 [build]
@@ -16,4 +16,6 @@ paths_exclude_pattern = [
     ".*",
     "/*.zip",
     "dist/",
+    "tests/",
+    "docs/",
 ]
