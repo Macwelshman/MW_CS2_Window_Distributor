@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MW CS2 Window Distributor",
     "author": "Macwelshman",
-    "version": (2, 7, 5),
+    "version": (2, 7, 6),
     "blender": (5, 2, 0),
     "location": "UV Editor > Sidebar",
     "description": "Distribute windows across the CS2 window space.",
@@ -634,50 +634,57 @@ class CS2WD_OT_WorldOrient(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.object
-        return obj and obj.type == 'MESH' and obj.mode == 'EDIT' and obj.data.uv_layers
+        return any(obj.data.uv_layers for obj in _edit_mesh_objects(context))
 
     def execute(self, context):
-        obj = context.object
+        objects = [obj for obj in _edit_mesh_objects(context) if obj.data.uv_layers]
         selected_uv_faces = (
             {}
             if context.tool_settings.use_uv_select_sync
-            else _snapshot_uv_face_selection(context, [obj])
+            else _snapshot_uv_face_selection(context, objects)
         )
-        me = obj.data
-        bm = bmesh.from_edit_mesh(me)
-        uv_layer = bm.loops.layers.uv.verify()
-        bm.faces.ensure_lookup_table()
-        matrix = obj.matrix_world
-        try:
-            normal_matrix = _world_normal_transform(matrix)
-        except ValueError:
-            self.report({'WARNING'}, "Cannot orient UVs: object transform has zero scale")
-            return {'CANCELLED'}
-
-        if context.tool_settings.use_uv_select_sync:
-            selected_faces = [face for face in bm.faces if face.select]
-        else:
-            selected_faces = _get_selected_faces(
-                bm, uv_layer, selected_uv_faces.get(obj)
-            )
-        if not selected_faces:
-            self.report({'WARNING'}, "No UV islands selected")
-            return {'CANCELLED'}
-
-        islands = _get_uv_islands(bm, uv_layer)
         counts = {"ROTATED": 0, "ALIGNED": 0, "SKIPPED": 0}
         reasons = {}
-        selected_faces = set(selected_faces)
-        for island in islands:
-            if any(f in selected_faces for f in island):
-                outcome, reason = _world_orient_island(island, uv_layer, matrix, normal_matrix)
-                counts[outcome] += 1
-                if reason:
-                    reasons[reason] = reasons.get(reason, 0) + 1
+        invalid_objects = 0
+        for obj in objects:
+            me = obj.data
+            bm = bmesh.from_edit_mesh(me)
+            uv_layer = bm.loops.layers.uv.active
+            bm.faces.ensure_lookup_table()
+            matrix = obj.matrix_world
+            try:
+                normal_matrix = _world_normal_transform(matrix)
+            except ValueError:
+                invalid_objects += 1
+                continue
 
-        if counts["ROTATED"]:
-            bmesh.update_edit_mesh(me)
+            if context.tool_settings.use_uv_select_sync:
+                selected_faces = [face for face in bm.faces if face.select and not face.hide]
+            else:
+                selected_faces = _get_selected_faces(
+                    bm, uv_layer, selected_uv_faces.get(obj)
+                )
+            if not selected_faces:
+                continue
+
+            islands = _get_uv_islands(bm, uv_layer)
+            selected_faces = set(selected_faces)
+            rotated = False
+            for island in islands:
+                if any(f in selected_faces for f in island):
+                    outcome, reason = _world_orient_island(island, uv_layer, matrix, normal_matrix)
+                    counts[outcome] += 1
+                    rotated |= outcome == "ROTATED"
+                    if reason:
+                        reasons[reason] = reasons.get(reason, 0) + 1
+
+            if rotated:
+                bmesh.update_edit_mesh(me)
+        if invalid_objects:
+            reasons["object(s) with zero scale"] = invalid_objects
+        if not any(counts.values()) and not invalid_objects:
+            self.report({'WARNING'}, "No UV islands selected")
+            return {'CANCELLED'}
         successful = counts["ROTATED"] + counts["ALIGNED"]
         message = (f"Rotated {counts['ROTATED']} island(s); "
                    f"{counts['ALIGNED']} already aligned; skipped {counts['SKIPPED']}")

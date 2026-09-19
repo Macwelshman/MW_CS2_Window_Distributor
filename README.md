@@ -25,7 +25,7 @@ The add-on places selected UV islands into predefined non-residential or residen
 - A mesh with an existing UV map
 - Window UV islands prepared for placement within the CS2 window atlas
 
-The current source version is **2.7.5**.
+The current source version is **2.7.6**.
 
 ## Installation
 
@@ -178,12 +178,12 @@ The operator uses world-area-weighted surface normals and a weighted circular av
 
 ## Multi-object workflow
 
-The add-on can distribute islands from several objects in one operation.
+Both Orientate UVs and Distribute support several mesh objects in Edit Mode. Orientation uses each object's own world transform and reports combined results.
 
 1. Select all required mesh objects.
 2. Enter multi-object Edit Mode.
 3. Select the required faces or UV islands on each object.
-4. Click **Distribute**.
+4. Click **Orientate UVs** if needed, then **Distribute**.
 
 The add-on gathers the selected islands from all editable mesh objects, distributes them as one combined set, and updates each object afterwards.
 
@@ -261,7 +261,7 @@ Increase **Tile Padding** slightly. Final requirements depend on the atlas resol
 Repository installations use Blender's normal **Check for Updates** workflow.
 Manual installations must be replaced with the newer release ZIP.
 
-The version installed from the current source should appear as **2.7.5**.
+The version installed from the current source should appear as **2.7.6**.
 
 ## Development
 
@@ -282,7 +282,7 @@ MW_CS2_Window_Distributor/
 ├── blender_manifest.toml
 ├── README.md
 └── dist/
-    └── mw_cs2_window_distributor-2.7.5.zip
+    └── mw_cs2_window_distributor-2.7.6.zip
 ```
 
 ## Disclaimer
@@ -298,3 +298,11 @@ Cities: Skylines II and its associated names and trademarks belong to their resp
 - Non-Residential mode label; exclusion of tiles 1 and 25 remains available in both modes.
 - World-space UV orientation fixes and Blender 5.2 compatibility.
 - Updated [user guide](docs/USER_GUIDE.md) and [PDF guide](docs/MW_CS2_Window_Distributor_Guide.pdf).
+
+## Version 2.7.6
+
+- Fixed Orientate UVs processing only the active object during multi-object editing.
+- All participating meshes with UV maps are now processed using their own world transforms and UV selections.
+- Objects with zero scale are reported without preventing valid objects from being processed.
+- Orientation algorithm, atlas distribution and existing controls are unchanged.
+- Validated in Blender 5.2.2 with UV Sync Selection on/off, different active objects, repeated execution and multi-object Undo; user confirmed the installed fix.

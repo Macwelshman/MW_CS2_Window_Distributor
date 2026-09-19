@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "mw_cs2_window_distributor"
-version = "2.7.5"
+version = "2.7.6"
 name = "MW CS2 Window Distributor"
 tagline = "Distribute window UV islands across the CS2 window atlas"
 maintainer = "MacWelshman"

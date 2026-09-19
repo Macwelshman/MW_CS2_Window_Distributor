@@ -1,5 +1,5 @@
 # MW CS2 Window Distributor
-Version 2.7.5 | Macwelshman | Blender 5.2 or later
+Version 2.7.6 | Macwelshman | Blender 5.2 or later
 
 ## Prepare and select
 1. Unwrap the window mesh and check that the window faces have usable UVs.
@@ -21,7 +21,7 @@ Install the release ZIP using Blender's Install from Disk command in Preferences
 
 https://raw.githubusercontent.com/Macwelshman/MW-Blender-Extensions/main/index.json
 
-After manually replacing an installed source file, restart Blender. The installed version should be 2.7.5.
+After manually replacing an installed source file, restart Blender. The installed version should be 2.7.6.
 
 ---
 
@@ -59,7 +59,7 @@ Distribution is repeatable by default. Within each occupied tile, islands use a 
 Use modest padding values. Excessive padding or many islands in one tile can leave insufficient usable space. Inspect the result for tile clearance and overlaps before export.
 
 ## Orientate UVs
-Orientate UVs uses the selected islands' world-space surface orientation. Object rotation and non-zero scale can remain unapplied. The result reports rotated, already aligned and skipped islands. Conflicting edge directions, unusable geometry and zero-scale transforms may prevent orientation.
+Orientate UVs processes selected islands across all mesh objects in Edit Mode that have UV maps, using each object's world-space surface orientation. Object rotation and non-zero scale can remain unapplied. The combined result reports rotated, already aligned and skipped islands. Objects with zero scale are reported while valid objects continue. Conflicting edge directions, unusable geometry and zero-scale transforms may prevent orientation.
 
 Orient before distributing: rotating after packing can move UVs outside the tile. Curved or unusual window surfaces may need manual adjustment. Orientation works on whole islands touched by selected faces; selected-only distribution has a stricter face boundary.
 
@@ -69,7 +69,7 @@ Orient before distributing: rotating after packing can move UVs outside the tile
 - Tiles 1 and 25 missing: check Exclude Always On/Off.
 - Windows too small: consider Allow Upscale, lower padding or more enabled categories.
 - Arrangement does not change: enable Randomize Distribution and change Random Seed.
-- Multiple objects: enter Edit Mode with the required mesh objects, then select the UVs to distribute on each.
+- Multiple objects: enter Edit Mode with the required mesh objects, then select the UVs on each and run Orientate UVs before Distribute.
 
 Both operators support Undo. Keep a saved copy and inspect the atlas placement and in-game result before final export.
 
