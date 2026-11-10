@@ -16,7 +16,7 @@ The add-on places selected UV islands into predefined non-residential or residen
 - Optional seeded random distribution.
 - World-orients selected UV islands from their mesh surface orientation.
 - Supports UV Sync Selection on or off.
-- Includes compatibility handling for Blender 5.2 UV selection attributes.
+- Reads native Blender 5.2 BMesh UV selection without leaving Edit Mode.
 - Distribution and orientation operations support Undo.
 
 ## Requirements
@@ -25,7 +25,7 @@ The add-on places selected UV islands into predefined non-residential or residen
 - A mesh with an existing UV map
 - Window UV islands prepared for placement within the CS2 window atlas
 
-The current source version is **2.7.6**.
+The current source version is **2.7.7**.
 
 ## Installation
 
@@ -91,7 +91,7 @@ Select the relevant mesh faces in Edit Mode. Only those selected faces will be d
 
 ### UV Sync Selection disabled
 
-Select the complete UV island in the UV Editor. All UV vertices belonging to each face should be selected.
+Select complete UV faces or islands in the UV Editor. Vertex mode requires every vertex of a face; Edge mode requires every edge; Face mode uses native face selection. Island selection is supported through Blender's island-selection toggle. Partial faces stay unchanged.
 
 Unselected faces stay unchanged, including faces connected to selected UVs. To make a second pass, deselect all UVs, select only the windows to change, switch the enabled window categories, then click **Distribute** again. For example, distribute Curtains first, then select a few windows and run a Blank-only pass.
 
@@ -118,13 +118,26 @@ Residential mode provides:
 - **Curtains (Closed)**: tiles 4, 6, 10, 12, 18 and 24.
 - **Blank**: tiles 1, 2, 5, 7, 8, 13, 14, 16, 19, 20, 21, 22 and 25.
 
-Enable one or more groups to combine their tile sets. Tile numbering runs left to right, starting at the top-left. **Exclude Always On/Off** removes tiles 1 and 25 in either mode when enabled.
+Enable one or more groups to combine their tile sets. With no category selected in the current mode, distribution cancels; it does not fall back to other categories. Tile numbering runs left to right, starting at the top-left. **Exclude Always On/Off** removes tiles 1 and 25 in either mode when enabled.
 
 ## Controls
 
 ### Exclude Always On/Off
 
 Excludes the first and last atlas tiles from distribution. These correspond to the two edge tiles reserved by the add-on as always-on/always-off variants.
+
+Under **Packing**, choose **Pixels** and select the full square atlas resolution
+(512, 1024, 2048, 4096, or **Custom**). Enter Tile Padding and Island Padding
+in pixels. The readout below the fields shows the equivalent atlas UV distances:
+4 px on a 2048 px atlas is 4 ÷ 2048 = 0.001953125 UV. Use the full atlas size,
+not the size of one tile.
+
+Existing scenes retain their UV padding settings. The **UV** and **Pixels**
+modes store separate values, so switching back restores the previous settings
+for that mode. Tile Padding applies on both sides of each tile, so it must
+be less than one tenth of the atlas resolution. The panel flags padding that
+leaves no tile area. If the assigned islands and their spacing cannot fit,
+distribution cancels before editing any UVs.
 
 ### Tile Padding
 
@@ -142,11 +155,11 @@ Adds spacing between multiple islands packed into the same atlas tile.
 - Default: `0.001`
 - Range: `0.0–0.05`
 
-Very high values can leave too little room for the UV islands.
+Very high values can leave too little room for the UV islands. Distribution validates every tile before writing any UV coordinates and cancels with a warning if there is insufficient space. Original UVs remain unchanged on failure.
 
 ### Allow Upscale
 
-Allows islands to grow to fill their calculated grid cells.
+Allows islands to grow together to use more of their assigned tile.
 
 When disabled, islands can be reduced to fit but will not be enlarged beyond their current UV scale. When enabled, the add-on may enlarge them while preserving their aspect ratio.
 
@@ -178,7 +191,7 @@ The operator uses world-area-weighted surface normals and a weighted circular av
 
 ## Multi-object workflow
 
-Both Orientate UVs and Distribute support several mesh objects in Edit Mode. Orientation uses each object's own world transform and reports combined results.
+Both Orientate UVs and Distribute use each mesh's active UV map and support several mesh objects in Edit Mode. Meshes without UV maps are skipped; neither operator creates a map. Orientation uses each object's own world transform and reports combined results.
 
 1. Select all required mesh objects.
 2. Enter multi-object Edit Mode.
@@ -189,16 +202,9 @@ The add-on gathers the selected islands from all editable mesh objects, distribu
 
 ## Packing behaviour
 
-Each atlas tile is divided into a square-like grid based on the number of islands assigned to it.
+Each tile starts at its padded upper-left corner. Islands advance left to right by their actual width plus Island Padding. Each new row starts below the tallest island in the preceding row, with the same gap. The add-on chooses row breaks and one shared scale per tile, preserving each island's proportions.
 
-The add-on then:
-
-1. Calculates the available cell size after padding.
-2. Finds one uniform scale that allows every island in that tile to fit.
-3. Preserves the aspect ratio and relative proportions of the islands.
-4. Centres each island inside its allocated cell.
-
-Because one scale is used per tile, smaller islands may not fill their cells as much as larger islands in the same tile.
+Distribution validates the full atlas before writing UVs. The operator reports the number of islands, tiles used, overlaps and out-of-bounds islands. If a layout cannot fit, reduce padding, enable more tile categories, or select fewer islands and try again.
 
 ## Recommended workflow
 
@@ -261,7 +267,7 @@ Increase **Tile Padding** slightly. Final requirements depend on the atlas resol
 Repository installations use Blender's normal **Check for Updates** workflow.
 Manual installations must be replaced with the newer release ZIP.
 
-The version installed from the current source should appear as **2.7.6**.
+The version installed from the current source should appear as **2.7.7**.
 
 ## Development
 
@@ -282,7 +288,7 @@ MW_CS2_Window_Distributor/
 ├── blender_manifest.toml
 ├── README.md
 └── dist/
-    └── mw_cs2_window_distributor-2.7.6.zip
+    └── mw_cs2_window_distributor-2.7.7.zip
 ```
 
 ## Disclaimer
@@ -306,3 +312,12 @@ Cities: Skylines II and its associated names and trademarks belong to their resp
 - Objects with zero scale are reported without preventing valid objects from being processed.
 - Orientation algorithm, atlas distribution and existing controls are unchanged.
 - Validated in Blender 5.2.2 with UV Sync Selection on/off, different active objects, repeated execution and multi-object Undo; user confirmed the installed fix.
+
+Packing uses atlas UV units internally: the atlas spans 0–1 and each tile is 0.2 wide/high. Tile Padding is minimum edge clearance; Island Padding is the minimum inter-island gap, counted once between islands or rows. Mixed sizes may leave larger gaps. Invalid packing cancels the entire operation with an “Insufficient tile space” warning, preserving all UVs.
+
+## Version 2.7.7
+
+- Pack UV islands in rows from the padded upper-left corner of each tile, with one uniform scale per tile.
+- Validate the whole layout before editing UVs. Distribution reports island, tile, overlap and out-of-bounds counts.
+- Support pixel padding with preset or custom atlas resolution alongside legacy UV padding.
+- Packing regression suite passed through Flue on Blender 5.2.3 LTS and Blender 5.3.0 Beta and Release Candidate.

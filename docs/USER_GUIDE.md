@@ -50,11 +50,11 @@ Always enable the categories you want before clicking Distribute. Selecting a ne
 # Packing and orientation
 ## Packing controls
 - Tile Padding: adds clearance inside each tile boundary.
-- Island Padding: adds clearance between allocated cells within a tile.
-- Allow Upscale: permits islands to grow to fill their cells.
+- Island Padding: adds clearance between islands in a row and between rows.
+- Allow Upscale: permits islands to grow together to use more of the tile.
 - Randomize Distribution: shuffles island assignment using Random Seed. The same selection and seed repeat the same arrangement; change the seed for a different arrangement.
 
-Distribution is repeatable by default. Within each occupied tile, islands use a common uniform scale and are centred in their allocated cells. Cells are filled from the top-left across rows. Aspect ratios are preserved, but scale can differ between tiles.
+Distribution is repeatable by default. Each occupied tile starts at its padded upper-left corner. Islands share one uniform scale and advance left to right by their actual widths. New rows start below the tallest island in the previous row. Aspect ratios are preserved, but scale can differ between tiles.
 
 Use modest padding values. Excessive padding or many islands in one tile can leave insufficient usable space. Inspect the result for tile clearance and overlaps before export.
 
@@ -74,3 +74,21 @@ Orient before distributing: rotating after packing can move UVs outside the tile
 Both operators support Undo. Keep a saved copy and inspect the atlas placement and in-game result before final export.
 
 This independent community add-on is not affiliated with Iceflake Studios or Paradox Interactive.
+
+## Reliability and active UV maps
+
+Both operators use each object's active UV map, skip meshes without a UV map,
+and preserve Edit Mode and selection. UV selection is read through native BMesh
+APIs: complete vertices in Vertex mode, complete edges in Edge mode, selected
+faces in Face mode, and complete faces with the Island selection toggle.
+Partial faces do not distribute. Orientation retains its whole-island behaviour.
+
+Select at least one category in the current Residential or Non-Residential mode.
+Empty category selections cancel rather than using a fallback tile set.
+Distribution plans and validates all tiles before writing UVs. If padding leaves
+no usable space, or an island would collapse, it cancels without changing UVs.
+Reduce padding or enable more categories and try again.
+
+Under Packing, choose **Pixels** and select the square atlas resolution (512, 1024, 2048, 4096, or Custom). Enter whole pixels; the panel shows the corresponding UV distances. For example, 4 px at 2048 is 4 / 2048 = 0.001953125 UV. Changing the resolution keeps the pixel counts and recalculates their UV distances.
+
+**UV** is the default for existing files and preserves their original settings. Pixel and UV values are stored separately, so switching back restores the UV settings. The atlas spans 0–1 and each of the 25 tiles is 0.2 wide/high. Tile Padding must be less than one tenth of the atlas resolution in Pixels mode because it applies to both sides. Tile Padding is minimum edge clearance; Island Padding is the minimum inter-island gap, counted once between islands or rows. Mixed sizes may leave larger gaps. Invalid packing cancels the entire operation with an “Insufficient tile space” warning, preserving all UVs.

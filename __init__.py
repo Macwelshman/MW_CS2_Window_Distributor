@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MW CS2 Window Distributor",
     "author": "Macwelshman",
-    "version": (2, 7, 6),
+    "version": (2, 7, 7),
     "blender": (5, 2, 0),
     "location": "UV Editor > Sidebar",
     "description": "Distribute windows across the CS2 window space.",
@@ -24,15 +24,109 @@ RESI_CUR_TILES = [2, 8, 10, 14, 16, 22]
 RESI_CUR_CLOSED_TILES = [3, 5, 9, 11, 17, 23]
 RESI_BLANK_TILES = [0, 1, 4, 6, 7, 12, 13, 15, 18, 19, 20, 21, 24]
 
-def _tile_uniform_scale(islands, cell_w, cell_h, allow_upscale):
-    """Return one scale that fits every island in an identically sized cell."""
+def _effective_padding(props):
+    if props.padding_units == 'UV':
+        return props.tile_padding, props.island_padding
+    resolution = (props.custom_resolution if props.atlas_resolution == 'CUSTOM'
+                  else int(props.atlas_resolution))
+    return props.tile_padding_px / resolution, props.island_padding_px / resolution
+
+
+def _validate_padding(tile_w, tile_h, tile_padding, island_padding):
+    if not all(math.isfinite(v) and v >= 0 for v in (tile_padding, island_padding)):
+        raise ValueError("Padding must be finite and non-negative")
+    if 2 * tile_padding >= min(tile_w, tile_h):
+        raise ValueError("Tile Padding leaves no usable tile area")
+
+
+def _plan_tile(islands, tile_pos, tile_w, tile_h, tile_padding, island_padding, allow_upscale):
+    """Pack consecutive islands into shelves at a single scale per tile."""
     if not islands:
-        return 1.0
-    max_w = max(d["size"].x for d in islands)
-    max_h = max(d["size"].y for d in islands)
-    eps = 1e-8
-    scale = min(cell_w / max(max_w, eps), cell_h / max(max_h, eps))
-    return scale if allow_upscale else min(scale, 1.0)
+        return []
+    _validate_padding(tile_w, tile_h, tile_padding, island_padding)
+    sizes = [tuple(data["size"]) for data in islands]
+    if not all(math.isfinite(v) and v > 0 for size in sizes for v in size):
+        raise ValueError("invalid island bounds; unwrap degenerate UV faces")
+    width = tile_w - 2 * tile_padding
+    height = tile_h - 2 * tile_padding
+    gap = island_padding
+    count = len(sizes)
+
+    def shelves(scale):
+        # Minimum total shelf height for each prefix. Trying all possible
+        # row breaks avoids false failures when an early wrap groups tall UVs.
+        heights = [0.0] + [math.inf] * count
+        starts = [0] * (count + 1)
+        for start in range(count):
+            used = heights[start]
+            if not math.isfinite(used):
+                continue
+            row_w, row_h = 0.0, 0.0
+            for end in range(start, count):
+                w, h = sizes[end]
+                row_w += w * scale
+                row_h = max(row_h, h * scale)
+                total = used + row_h + (gap if start else 0.0)
+                if row_w > width - (end - start) * gap or total > height:
+                    break
+                if total < heights[end + 1]:
+                    heights[end + 1] = total
+                    starts[end + 1] = start
+        if not math.isfinite(heights[count]):
+            return None
+        rows = []
+        end = count
+        while end:
+            start = starts[end]
+            rows.append((start, end))
+            end = start
+        return rows[::-1]
+
+    upper = min(width / max(w for w, h in sizes), height / max(h for w, h in sizes))
+    if not allow_upscale:
+        upper = min(upper, 1.0)
+    if not math.isfinite(upper) or upper <= 0:
+        raise ValueError("invalid uniform scale")
+    rows = shelves(upper)
+    scale = upper
+    if rows is None:
+        scale = 0.0
+        for _ in range(48):
+            trial = scale + (upper - scale) / 2
+            candidate = shelves(trial)
+            if candidate is None:
+                upper = trial
+            else:
+                scale, rows = trial, candidate
+        if rows is None:
+            raise ValueError("required gaps leave no room for these islands")
+
+    x, y = tile_pos
+    top = y + tile_h - tile_padding
+    result = []
+    for start, end in rows:
+        left = x + tile_padding
+        for w, h in sizes[start:end]:
+            right, bottom = left + w * scale, top - h * scale
+            result.append((scale, (left, bottom), (left, bottom, right, top)))
+            left = right + gap
+        top -= max(h for w, h in sizes[start:end]) * scale + gap
+    return result
+
+
+def _validate_tile_layout(boxes, bounds, gap):
+    """Return (overlapping pairs, out-of-bounds islands, missing-gap pairs)."""
+    eps = 1e-7  # Blender stores UV coordinates as float32.
+    overlaps = outside = missing_gap = 0
+    for i, box in enumerate(boxes):
+        outside += any(box[a] < bounds[a] - eps or box[a + 2] > bounds[a + 2] + eps
+                       for a in (0, 1))
+        for other in boxes[:i]:
+            separation = max(max(box[a] - other[a + 2], other[a] - box[a + 2])
+                             for a in (0, 1))
+            overlaps += separation < -eps
+            missing_gap += separation < gap - eps
+    return overlaps, outside, missing_gap
 
 
 def _uv_edges_match(loop_a, loop_b, uv_layer):
@@ -71,80 +165,48 @@ def _edit_mesh_objects(context):
     ]
 
 
+def _active_uv_layer(obj, bm):
+    """Resolve the mesh's chosen UV map by name; never create a layer."""
+    active = obj.data.uv_layers.active
+    return bm.loops.layers.uv.get(active.name) if active else None
+
+
 # -----------------------------
 # World Orientation Helpers
 # -----------------------------
-def _bmesh_has_uv_selection(bm, uv_layer):
-    """Return whether this Blender version exposes UV selection on BMLoopUV."""
-    for face in bm.faces:
-        if face.loops:
-            return hasattr(face.loops[0][uv_layer], "select")
-    return True
-
-
 def _snapshot_uv_face_selection(context, objects):
-    """Return selected UV face indices when BMLoopUV.select is unavailable.
-
-    Blender 5.2 stores UV selection in mesh attributes that are only exposed
-    through Python outside Edit Mode. Temporarily leaving and restoring Edit
-    Mode commits those attributes without changing the user's selection.
-    """
-    needs_snapshot = False
+    """Read native Edit BMesh selection without changing mode or selection."""
+    mode = context.tool_settings.uv_select_mode
+    snapshots = {}
     for obj in objects:
         bm = bmesh.from_edit_mesh(obj.data)
-        uv_layer = bm.loops.layers.uv.verify()
+        uv_layer = _active_uv_layer(obj, bm)
         bm.faces.ensure_lookup_table()
-        if not _bmesh_has_uv_selection(bm, uv_layer):
-            needs_snapshot = True
-            break
-
-    if not needs_snapshot:
-        return {}
-
-    active = context.view_layer.objects.active
-    snapshots = {}
-    bpy.ops.object.mode_set(mode='OBJECT')
-    try:
-        for obj in objects:
-            mesh = obj.data
-            vert_selection = mesh.attributes.get(".uv_select_vert")
-            face_selection = mesh.attributes.get(".uv_select_face")
-            selected = set()
-
-            if vert_selection:
-                for polygon in mesh.polygons:
-                    if all(vert_selection.data[i].value for i in polygon.loop_indices):
-                        selected.add(polygon.index)
-            elif face_selection:
-                selected.update(
-                    polygon.index
-                    for polygon in mesh.polygons
-                    if face_selection.data[polygon.index].value
-                )
-            # Missing UV selection attributes mean no UV selection, not all
-            # mesh-selected faces (which may only be visible in the UV editor).
-
-            snapshots[obj] = selected
-    finally:
-        if active:
-            context.view_layer.objects.active = active
-        bpy.ops.object.mode_set(mode='EDIT')
-
+        bm.faces.index_update()
+        snapshots[obj] = {
+            face.index for face in _get_selected_faces(bm, uv_layer, selection_mode=mode)
+        } if uv_layer else set()
     return snapshots
 
 
-def _get_selected_faces(bm, uv_layer, selected_face_indices=None):
+def _get_selected_faces(bm, uv_layer, selected_face_indices=None, selection_mode='VERTEX'):
+    """Only complete selected faces participate; partial vertices/edges stay put."""
+    if uv_layer is None:
+        return []
     selected = []
-    for f in bm.faces:
-        if not f.select:
+    for face in bm.faces:
+        if face.hide or not face.select:
             continue
         if selected_face_indices is not None:
-            if f.index not in selected_face_indices:
-                continue
-        else:
-            if not all(loop[uv_layer].select for loop in f.loops):
-                continue
-        selected.append(f)
+            chosen = face.index in selected_face_indices
+        elif selection_mode == 'FACE':
+            chosen = face.uv_select
+        elif selection_mode == 'EDGE':
+            chosen = all(loop.uv_select_edge for loop in face.loops)
+        else:  # Vertex and Island modes both require the full face.
+            chosen = all(loop.uv_select_vert for loop in face.loops)
+        if chosen:
+            selected.append(face)
     return selected
 
 def _island_center(faces, uv_layer):
@@ -352,13 +414,42 @@ class CS2WDProperties(bpy.types.PropertyGroup):
         description="Choose distribution mode"
     )
 
+    padding_units: bpy.props.EnumProperty(
+        name="Padding Units",
+        items=[('UV', "UV", "Keep normalized atlas padding"),
+               ('PIXELS', "Pixels", "Set padding in texture pixels")],
+        default='UV'
+    )
+
+    atlas_resolution: bpy.props.EnumProperty(
+        name="Atlas Resolution",
+        items=[(str(size), str(size), f"{size} × {size} pixels")
+               for size in (512, 1024, 2048, 4096)]
+              + [('CUSTOM', "Custom", "Specify the square atlas size")],
+        default='2048'
+    )
+
+    custom_resolution: bpy.props.IntProperty(
+        name="Custom Size", default=2048, min=1, subtype='PIXEL'
+    )
+
+    tile_padding_px: bpy.props.IntProperty(
+        name="Tile Padding", default=0, min=0, subtype='PIXEL',
+        description="Minimum clearance inside each tile edge"
+    )
+
+    island_padding_px: bpy.props.IntProperty(
+        name="Island Padding", default=2, min=0, subtype='PIXEL',
+        description="Minimum gap between islands within a tile"
+    )
+
     tile_padding: bpy.props.FloatProperty(
         name="Tile Padding",
         default=0.0,
         min=0.0,
         max=0.05,
         subtype='FACTOR',
-        description="Padding around the edge of every CS2 tile"
+        description="Minimum tile-edge clearance in atlas UV units (tile width 0.2)"
     )
 
     island_padding: bpy.props.FloatProperty(
@@ -367,7 +458,7 @@ class CS2WDProperties(bpy.types.PropertyGroup):
         min=0.0,
         max=0.05,
         subtype='FACTOR',
-        description="Padding between UV islands within a tile"
+        description="Minimum island gap in atlas UV units, counted once between islands or rows"
     )
 
     randomize_distribution: bpy.props.BoolProperty(
@@ -386,7 +477,7 @@ class CS2WDProperties(bpy.types.PropertyGroup):
     allow_upscale: bpy.props.BoolProperty(
         name="Allow Upscale",
         default=False,
-        description="Allow islands to be enlarged to fill their grid cells"
+        description="Allow islands to grow to fit the usable tile area"
     )
     
     def validate_window_selection(self):
@@ -419,8 +510,6 @@ class CS2WDProperties(bpy.types.PropertyGroup):
                 tiles.update([3, 5, 9, 11, 17, 23])
             if self.use_specific_tiles:
                 tiles.update([1, 7, 13, 15, 19, 21])
-            if not tiles:
-                return list(range(25))
             return sorted(tiles)
         else:
             # Residential presets use the atlas's exact numbered tile sets.
@@ -431,8 +520,6 @@ class CS2WDProperties(bpy.types.PropertyGroup):
                 tiles.update(RESI_CUR_CLOSED_TILES)
             if self.use_specific_tiles:
                 tiles.update(RESI_BLANK_TILES)
-            if not tiles:
-                tiles.update(RESI_CUR_TILES)
             return sorted(tiles)
 
 # -----------------------------
@@ -450,8 +537,10 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
 
     def _collect_island_data(self, obj, use_uv_sync, selected_face_indices=None):
         bm = bmesh.from_edit_mesh(obj.data)
-        uv_layer = bm.loops.layers.uv.verify()
+        uv_layer = _active_uv_layer(obj, bm)
         bm.faces.ensure_lookup_table()
+        if uv_layer is None:
+            return [], bm
 
         islands = []
         visited = set()
@@ -518,16 +607,20 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
             return {'CANCELLED'}
 
         props = context.scene.cs2wd_props
+        if not props.validate_window_selection():
+            self.report({'WARNING'}, "Select at least one window category for the current mode")
+            return {'CANCELLED'}
+        if not any(obj.data.uv_layers.active for obj in objects):
+            self.report({'WARNING'}, "Meshes need an existing active UV map")
+            return {'CANCELLED'}
         selected_uv_faces = (
             {}
             if context.tool_settings.use_uv_select_sync
             else _snapshot_uv_face_selection(context, objects)
         )
 
-        tile_padding = props.tile_padding
-        island_padding = props.island_padding
+        tile_padding, island_padding = _effective_padding(props)
 
-        mode_label = "multi-object" if len(objects) > 1 else "single"
         if DEBUG_TILE_SCALES:
             print("cs2wd OBJECTS:", [o.name for o in objects])
 
@@ -561,15 +654,12 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
                 })
 
         tile_indices = props.get_selected_tiles()
-        if not tile_indices:
-            tile_indices = list(range(25))
         if props.exclude_edges:
             tile_indices = [i for i in tile_indices if i not in (0, 24)]
-            if not tile_indices:
-                tile_indices = [i for i in range(25) if i not in (0, 24)]
+        if not tile_indices:
+            self.report({'WARNING'}, "No usable atlas tiles in the selected categories")
+            return {'CANCELLED'}
 
-        for t in tiles:
-            t["islands"] = []
         # Stable order makes repeated runs reproducible.  Randomization is opt-in.
         island_data.sort(key=lambda data: (data["obj"].name, data["min"].y, data["min"].x))
         if props.randomize_distribution:
@@ -578,38 +668,73 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
         for i, data in enumerate(island_data):
             tiles[tile_indices[i % len(tile_indices)]]["islands"].append(data)
 
-        # Place islands
-        for ti, tile in enumerate(tiles):
-            islands_in_tile = tile["islands"]
-            if not islands_in_tile:
-                continue
-            n = len(islands_in_tile)
-            grid_cols = math.ceil(math.sqrt(n))
-            grid_rows = math.ceil(n / grid_cols)
-            cell_w = (tile_w - 2 * tile_padding - (grid_cols - 1) * island_padding) / grid_cols
-            cell_h = (tile_h - 2 * tile_padding - (grid_rows - 1) * island_padding) / grid_rows
-            cell_w_eff = max(cell_w - 2 * island_padding, 0.0)
-            cell_h_eff = max(cell_h - 2 * island_padding, 0.0)
-            tile_scale = _tile_uniform_scale(
-                islands_in_tile, cell_w_eff, cell_h_eff, props.allow_upscale
-            )
-            if DEBUG_TILE_SCALES:
-                print(f"cs2wd DEBUG: tile {ti} n={n} cell_w={cell_w} cell_h={cell_h} tile_scale={tile_scale:.6f}")
+        tiles_used = sum(bool(tile["islands"]) for tile in tiles)
+        summary = f"{len(island_data)} islands, {tiles_used} tiles used"
 
-            for idx, data in enumerate(islands_in_tile):
-                col = idx % grid_cols
-                row = idx // grid_cols
-                cell_x = tile["pos"].x + tile_padding + col * (cell_w + island_padding)
-                cell_y = tile["pos"].y + tile_h - tile_padding - (row + 1) * cell_h - row * island_padding
-                width = data["size"].x
-                height = data["size"].y
-                scale_final = tile_scale
-                offset_i = Vector((
-                    cell_x + (cell_w - width * scale_final) * 0.5 - data["min"].x * scale_final,
-                    cell_y + (cell_h - height * scale_final) * 0.5 - data["min"].y * scale_final
-                ))
-                for uv, orig in zip(data["uvs"], data["coords"]):
-                    uv.uv = orig * scale_final + offset_i
+        # Plan all target coordinates before validating or writing any UVs.
+        proposed = []
+        for ti, tile in enumerate(tiles):
+            if not tile["islands"]:
+                continue
+            try:
+                plan = _plan_tile(tile["islands"], tile["pos"], tile_w, tile_h,
+                                  tile_padding, island_padding, props.allow_upscale)
+            except ValueError as exc:
+                self.report({'WARNING'}, f"{summary}. Insufficient tile space in tile {ti + 1}: "
+                            f"{exc}; reduce padding or enable more categories")
+                return {'CANCELLED'}
+            targets = []
+            for data, (scale, offset, _) in zip(tile["islands"], plan):
+                offset = Vector(offset)
+                targets.append((scale, [
+                    (uv, orig, (orig - data["min"]) * scale + offset)
+                    for uv, orig in zip(data["uvs"], data["coords"])
+                ]))
+            proposed.append((tile["pos"], targets))
+
+        # Validate the coordinates Blender will store, including float32 rounding.
+        placements = []
+        overlaps = outside = missing_gap = invalid = 0
+        for (x, y), targets in proposed:
+            boxes = []
+            for scale, writes in targets:
+                coords = [target for _, _, target in writes]
+                if not math.isfinite(scale) or scale <= 0 or not coords or not all(
+                        math.isfinite(v) for co in coords for v in co):
+                    invalid += 1
+                    continue
+                lo = [min(co[a] for co in coords) for a in (0, 1)]
+                hi = [max(co[a] for co in coords) for a in (0, 1)]
+                if any(high <= low for low, high in zip(lo, hi)):
+                    invalid += 1
+                    continue
+                boxes.append((*lo, *hi))
+                placements.extend(writes)
+            bounds = (x + tile_padding, y + tile_padding,
+                      x + tile_w - tile_padding, y + tile_h - tile_padding)
+            o, b, g = _validate_tile_layout(boxes, bounds, island_padding)
+            overlaps += o
+            outside += b
+            missing_gap += g
+
+        summary += f", {overlaps} overlaps, {outside} out of bounds"
+        if overlaps or outside or missing_gap or invalid:
+            self.report({'WARNING'}, f"{summary}. Insufficient tile space or invalid UVs: {missing_gap} pairs below required spacing, "
+                        f"{invalid} invalid islands. Reduce padding or enable more categories; "
+                        "check degenerate UVs if the problem persists")
+            return {'CANCELLED'}
+
+        # Commit only after the entire atlas passes validation.
+        try:
+            for uv, orig, target in placements:
+                uv.uv = target
+        except Exception:
+            for uv, orig, target in placements:
+                uv.uv = orig
+            for obj in objects:
+                bmesh.update_edit_mesh(obj.data)
+            self.report({'WARNING'}, "UV placement failed; original coordinates restored")
+            return {'CANCELLED'}
 
         # Update all objects
         updated = set()
@@ -621,6 +746,7 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
 
         if DEBUG_TILE_SCALES:
             print(f"cs2wd DISTRIBUTE: distributed {len(island_data)} islands across {len(updated)} object(s)")
+        self.report({'INFO'}, summary)
         return {'FINISHED'}
 
 # -----------------------------
@@ -634,10 +760,10 @@ class CS2WD_OT_WorldOrient(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return any(obj.data.uv_layers for obj in _edit_mesh_objects(context))
+        return any(obj.data.uv_layers.active for obj in _edit_mesh_objects(context))
 
     def execute(self, context):
-        objects = [obj for obj in _edit_mesh_objects(context) if obj.data.uv_layers]
+        objects = [obj for obj in _edit_mesh_objects(context) if obj.data.uv_layers.active]
         selected_uv_faces = (
             {}
             if context.tool_settings.use_uv_select_sync
@@ -649,8 +775,10 @@ class CS2WD_OT_WorldOrient(bpy.types.Operator):
         for obj in objects:
             me = obj.data
             bm = bmesh.from_edit_mesh(me)
-            uv_layer = bm.loops.layers.uv.active
+            uv_layer = _active_uv_layer(obj, bm)
             bm.faces.ensure_lookup_table()
+            if uv_layer is None:
+                continue
             matrix = obj.matrix_world
             try:
                 normal_matrix = _world_normal_transform(matrix)
@@ -725,8 +853,22 @@ class CS2WD_PT_MainPanel(bpy.types.Panel):
             layout.prop(props, "use_specific_tiles")
         layout.separator()
         layout.label(text="Packing")
-        layout.prop(props, "tile_padding")
-        layout.prop(props, "island_padding")
+        layout.prop(props, "padding_units", expand=True)
+        if props.padding_units == 'PIXELS':
+            layout.prop(props, "atlas_resolution")
+            if props.atlas_resolution == 'CUSTOM':
+                layout.prop(props, "custom_resolution")
+            layout.prop(props, "tile_padding_px")
+            layout.prop(props, "island_padding_px")
+            edge, gap = _effective_padding(props)
+            layout.label(text=f"UV: Edge {edge:.6g} / Gap {gap:.6g}")
+        else:
+            layout.prop(props, "tile_padding")
+            layout.prop(props, "island_padding")
+        try:
+            _validate_padding(0.2, 0.2, *_effective_padding(props))
+        except ValueError as exc:
+            layout.label(text=str(exc), icon='ERROR')
         layout.prop(props, "allow_upscale")
         layout.prop(props, "randomize_distribution")
         if props.randomize_distribution:
@@ -738,7 +880,7 @@ class CS2WD_PT_MainPanel(bpy.types.Panel):
         row.operator("cs2wd.world_orient", icon='WORLD')
         layout.separator()
         # Distribute button
-        op = layout.operator("cs2wd.distribute_uv", icon='UV')
+        layout.operator("cs2wd.distribute_uv", icon='UV')
 
 # -----------------------------
 # Register
