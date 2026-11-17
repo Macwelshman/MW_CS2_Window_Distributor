@@ -1,4 +1,5 @@
-"""blender --background --factory-startup --python-exit-code 1 --python tests/check_packing_blender.py"""
+"""Run through Flue in a disposable factory-startup Blender session."""
+import math
 from pathlib import Path
 import types
 import bpy
@@ -29,29 +30,42 @@ for obj in objects:
     for face in bm.faces: face.select_set(True)
     bmesh.update_edit_mesh(obj.data)
 def state():
-    result = []
-    for name in sorted(o.name for o in objects):
+    result = {}
+    for name in names:
         bm = bmesh.from_edit_mesh(bpy.data.objects[name].data)
         uv = bm.loops.layers.uv.active
-        result.append(tuple(tuple(loop[uv].uv) for face in bm.faces for loop in face.loops))
+        result[name] = tuple(tuple(loop[uv].uv) for face in bm.faces for loop in face.loops)
     return result
+names = {obj.name for obj in objects}
 props = bpy.context.scene.cs2wd_props
 assert props.padding_units == 'UV'
+assert math.isclose(props.tile_padding_percent, 1.0, abs_tol=1e-6)
+assert math.isclose(addon._effective_padding(props)[0], .002, abs_tol=1e-8)
+assert math.isclose(props.island_padding_percent, .5, abs_tol=1e-6)
+assert props.tile_padding_px == 4
+props.tile_padding = 0
+assert props.tile_padding_percent == 0  # An explicitly saved zero still means zero.
 props.tile_padding = .01; props.island_padding = .001
+assert math.isclose(props.tile_padding_percent, 5, abs_tol=1e-6)
+props.tile_padding_percent = 1.25
+props.island_padding_percent = .75
+assert all(math.isclose(actual, expected, abs_tol=1e-8)
+           for actual, expected in zip(addon._effective_padding(props), (.0025, .0015)))
 props.padding_units = 'PIXELS'
 props.atlas_resolution = '2048'
 props.tile_padding_px = props.island_padding_px = 4
 assert addon._effective_padding(props) == (4 / 2048, 4 / 2048)
 props.padding_units = 'UV'
-assert abs(addon._effective_padding(props)[0] - .01) < 1e-8
-props.padding_units = 'PIXELS'
+assert math.isclose(props.tile_padding_percent, 1.25, abs_tol=1e-6)
+assert math.isclose(props.island_padding_percent, .75, abs_tol=1e-6)
+print('PADDING_PERCENT_PASS: defaults, saved UV values, percent edits and independent pixel settings')
 before = state()
-bpy.ops.ed.undo_push(message='Before packing')
-assert bpy.ops.cs2wd.distribute_uv() == {'FINISHED'}
-assert state() != before
-bpy.ops.ed.undo_push(message='After packing')
+assert len(names) == 2
+assert bpy.ops.ed.undo_push(message='Before packing') == {'FINISHED'}
+assert bpy.ops.cs2wd.distribute_uv('EXEC_DEFAULT', True) == {'FINISHED'}
+after = state()
+assert all(after[name] != before[name] for name in names)
 assert bpy.ops.ed.undo() == {'FINISHED'}
-# Undo invalidates object references; recover names from the view layer.
-objects = [o for o in bpy.context.objects_in_mode_unique_data if o.type == 'MESH']
-assert state() == before
+assert {o.name for o in bpy.context.objects_in_mode_unique_data if o.type == 'MESH'} == names
+assert state() == before, 'Undo must exactly restore every UV on both meshes'
 print('PACKING_UNDO_PASS: native multi-object distribution restores UVs')

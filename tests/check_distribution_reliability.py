@@ -4,6 +4,7 @@ The Edit Mesh adapter is substituted locally, while native BMesh UV/selection
 and the actual operator implementations are exercised without registration.
 """
 import math
+import struct
 import types
 from mathutils import Matrix
 import bmesh
@@ -125,8 +126,9 @@ def run_checks(addon):
                 assert (coords(a), coords(b)) == before and not updates
         props.padding_units = 'UV'
         checks.append('24 seeded multi-object packs: containment, exclusion, padding, overlap, aspect, repeatability, active map')
-        # Exact reported Blank-only cases. Four per tile fits with the corrected
-        # once-only gap; 36 per tile cannot fit six columns of 0.05 gaps.
+        # Exact reported Blank-only cases. Four per tile fits in two rows.
+        # With 0.05 gaps there are at most 16 gap-sized centre cells per tile,
+        # even if the islands are arranged without shelves.
         saved_objects = context.objects_in_mode_unique_data
         for count, expected in ((24, {'FINISHED'}), (216, {'CANCELLED'})):
             obj = Obj('Reported', count)
@@ -139,7 +141,9 @@ def run_checks(addon):
             assert run() == expected, reports[-1:]
             if count == 216:
                 assert coords(obj) == before and not updates
-                assert 'Insufficient tile space' in reports[-1]
+                assert 'Insufficient tile space in tile 2' in reports[-1]
+                assert '36 islands; Tile Padding 0 UV, Island Padding 0.05 UV' in reports[-1]
+                assert 'required gaps alone' in reports[-1]
             else:
                 boxes = {}
                 for face in coords(obj):
@@ -152,16 +156,45 @@ def run_checks(addon):
                     for other in boxes.setdefault(ti, []):
                         assert any(box[k]>=other[k+2]+.05-1e-6 or other[k]>=box[k+2]+.05-1e-6 for k in (0,1))
                     boxes[ti].append(box)
+        early, late = Obj('Early', 1), Obj('Late', 1)
+        context.objects_in_mode_unique_data = [early, late]
+        context.edit_object = early
+        props.tile_padding = props.island_padding = 0
+        for obj in (early, late):
+            layer = obj.bm.loops.layers.uv['Active']
+            for loop, co in zip(next(iter(obj.bm.faces)).loops, [(0, 0), (1, 0), (1, 1), (0, 1)]):
+                loop[layer].uv = co
+        assert run() == {'FINISHED'}, reports[-1]
+        # Tile 2 ends at 0.4; its nearest float32 rounds outside the tile.
+        assert max(x for x, _ in coords(early)[0]) <= 2 / 5
+        assert min(x for x, _ in coords(early)[0]) >= 1 / 5
+        early_layer = early.bm.loops.layers.uv['Active']
+        for loop in next(iter(early.bm.faces)).loops:
+            loop[early_layer].uv.x += 2  # A partial commit would visibly move these UVs.
+        late_loops = next(iter(late.bm.faces)).loops
+        late_layer = late.bm.loops.layers.uv['Active']
+        def uv_bytes(obj):
+            return b''.join(struct.pack('ff', *co) for face in coords(obj) for co in face)
+        for height, reason in ((1e-10, 'collapse'), (math.nan, 'non-finite source UVs')):
+            # Keep both extents positive (the NaN is in the final corner),
+            # so this exercises validation after the earlier tile is planned.
+            for loop, co in zip(late_loops, [(0, 0), (1, 0), (1, 1e-10), (0, height)]):
+                loop[late_layer].uv = co
+            before = (uv_bytes(early), uv_bytes(late)); updates.clear()
+            assert run() == {'CANCELLED'}, reports[-1]
+            assert (uv_bytes(early), uv_bytes(late)) == before and not updates
+            assert 'Insufficient tile space in tile 8' in reports[-1]
+            assert 'Allow Upscale on' in reports[-1] and reason in reports[-1]
         context.objects_in_mode_unique_data = saved_objects; context.edit_object = a
         props.blinds_open = True; props.use_specific_tiles = False
-        checks.append('exact 24 Blank safe fit and 216 Blank atomic cancellation')
-        # Both early and later crowded tiles must fail before any changes.
+        checks.append('exact Blank repros, strict tile edge, and atomic later-tile precision/non-finite failures')
+        # Crowded tiles must fail before any changes.
         for tp,ip in ((.05,.1),(0,.2),(.05,.15)):
             reset(); props.tile_padding=tp; props.island_padding=ip
             before=(coords(a),coords(b)); updates.clear()
             assert run()=={'CANCELLED'}; assert (coords(a),coords(b))==before; assert not updates
         props.tile_padding=0; props.island_padding=.001
-        # Fail in a later tile after earlier tiles have already been planned.
+        # Reject an island with zero extent.
         reset(); props.randomize_distribution=False
         last=list(b.bm.faces)[-1]; layer=b.bm.loops.layers.uv['Active']
         for loop in last.loops: loop[layer].uv=(100,100)

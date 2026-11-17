@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MW CS2 Window Distributor",
     "author": "Macwelshman",
-    "version": (2, 7, 7),
+    "version": (2, 7, 8),
     "blender": (5, 2, 0),
     "location": "UV Editor > Sidebar",
     "description": "Distribute windows across the CS2 window space.",
@@ -11,6 +11,8 @@ bl_info = {
 import bpy
 import bmesh
 import random
+import struct
+from fractions import Fraction
 from mathutils import Vector
 import math
 
@@ -18,6 +20,7 @@ from math import sin, cos, atan2
 
 DEBUG_TILE_SCALES = False
 UV_EPSILON = 1e-6
+TILE_PERCENT_UV = 0.2 / 100
 
 # Residential mode tile sets (0-based indices)
 RESI_CUR_TILES = [2, 8, 10, 14, 16, 22]
@@ -35,11 +38,22 @@ def _effective_padding(props):
 def _validate_padding(tile_w, tile_h, tile_padding, island_padding):
     if not all(math.isfinite(v) and v >= 0 for v in (tile_padding, island_padding)):
         raise ValueError("Padding must be finite and non-negative")
-    if 2 * tile_padding >= min(tile_w, tile_h):
+    if not all(math.isfinite(v) and v > 2 * tile_padding for v in (tile_w, tile_h)):
         raise ValueError("Tile Padding leaves no usable tile area")
 
 
-def _plan_tile(islands, tile_pos, tile_w, tile_h, tile_padding, island_padding, allow_upscale):
+def _inward_float32(value, lower):
+    """Round a bound in the non-negative atlas towards the usable area."""
+    packed = struct.pack(">f", value)
+    rounded, = struct.unpack(">f", packed)
+    if (lower and rounded < value) or (not lower and rounded > value):
+        bits, = struct.unpack(">I", packed)
+        rounded, = struct.unpack(">f", struct.pack(">I", bits + (1 if lower else -1)))
+    return rounded
+
+
+def _plan_tile(islands, tile_pos, tile_w, tile_h, tile_padding, island_padding, allow_upscale,
+               *, stored_uvs=False):
     """Pack consecutive islands into shelves at a single scale per tile."""
     if not islands:
         return []
@@ -47,10 +61,36 @@ def _plan_tile(islands, tile_pos, tile_w, tile_h, tile_padding, island_padding, 
     sizes = [tuple(data["size"]) for data in islands]
     if not all(math.isfinite(v) and v > 0 for size in sizes for v in size):
         raise ValueError("invalid island bounds; unwrap degenerate UV faces")
+    x, y = tile_pos
+    if not all(math.isfinite(v) for v in (x, y)):
+        raise ValueError("non-finite tile coordinates")
     width = tile_w - 2 * tile_padding
     height = tile_h - 2 * tile_padding
     gap = island_padding
     count = len(sizes)
+
+    # Centres of positive-size boxes must be separated by more than the gap
+    # on at least one axis. A grid of gap-sized cells gives an upper bound
+    # even for layouts that do not use shelves.
+    if gap:
+        across = math.ceil(Fraction(width) / Fraction(gap))
+        down = math.ceil(Fraction(height) / Fraction(gap))
+        if count > across * down:
+            raise ValueError("required gaps alone rule out this many islands")
+
+    left_edge, bottom_edge = x + tile_padding, y + tile_padding
+    right_edge, top_edge = x + tile_w - tile_padding, y + tile_h - tile_padding
+    if stored_uvs:
+        left_edge = _inward_float32(left_edge, True)
+        bottom_edge = _inward_float32(bottom_edge, True)
+        right_edge = _inward_float32(right_edge, False)
+        top_edge = _inward_float32(top_edge, False)
+        width, height = right_edge - left_edge, top_edge - bottom_edge
+        if width <= 0 or height <= 0:
+            raise ValueError("Tile Padding leaves no usable area at Blender UV precision")
+        if gap:
+            # Allow for opposite rounding of two adjacent edges in [0, 1].
+            gap += 2 ** -24
 
     def shelves(scale):
         # Minimum total shelf height for each prefix. Trying all possible
@@ -98,16 +138,17 @@ def _plan_tile(islands, tile_pos, tile_w, tile_h, tile_padding, island_padding, 
                 upper = trial
             else:
                 scale, rows = trial, candidate
-        if rows is None:
-            raise ValueError("required gaps leave no room for these islands")
+        if rows is None or scale <= 0:
+            raise ValueError("no positive scale fits this island order in rows")
 
-    x, y = tile_pos
-    top = y + tile_h - tile_padding
+    top = top_edge
     result = []
     for start, end in rows:
-        left = x + tile_padding
+        left = left_edge
         for w, h in sizes[start:end]:
             right, bottom = left + w * scale, top - h * scale
+            if not all(math.isfinite(v) for v in (left, bottom, right, top)) or right <= left or top <= bottom:
+                raise ValueError("an island would collapse or have invalid coordinates at the shared scale")
             result.append((scale, (left, bottom), (left, bottom, right, top)))
             left = right + gap
         top -= max(h for w, h in sizes[start:end]) * scale + gap
@@ -116,16 +157,15 @@ def _plan_tile(islands, tile_pos, tile_w, tile_h, tile_padding, island_padding, 
 
 def _validate_tile_layout(boxes, bounds, gap):
     """Return (overlapping pairs, out-of-bounds islands, missing-gap pairs)."""
-    eps = 1e-7  # Blender stores UV coordinates as float32.
     overlaps = outside = missing_gap = 0
     for i, box in enumerate(boxes):
-        outside += any(box[a] < bounds[a] - eps or box[a + 2] > bounds[a + 2] + eps
+        outside += any(box[a] < bounds[a] or box[a + 2] > bounds[a + 2]
                        for a in (0, 1))
         for other in boxes[:i]:
             separation = max(max(box[a] - other[a + 2], other[a] - box[a + 2])
                              for a in (0, 1))
-            overlaps += separation < -eps
-            missing_gap += separation < gap - eps
+            overlaps += separation < 0
+            missing_gap += separation < gap and not math.isclose(separation, gap, rel_tol=1e-15)
     return overlaps, outside, missing_gap
 
 
@@ -416,7 +456,7 @@ class CS2WDProperties(bpy.types.PropertyGroup):
 
     padding_units: bpy.props.EnumProperty(
         name="Padding Units",
-        items=[('UV', "UV", "Keep normalized atlas padding"),
+        items=[('UV', "% of Tile", "Set padding as a percentage of one tile's width"),
                ('PIXELS', "Pixels", "Set padding in texture pixels")],
         default='UV'
     )
@@ -434,7 +474,7 @@ class CS2WDProperties(bpy.types.PropertyGroup):
     )
 
     tile_padding_px: bpy.props.IntProperty(
-        name="Tile Padding", default=0, min=0, subtype='PIXEL',
+        name="Tile Padding", default=4, min=0, subtype='PIXEL',
         description="Minimum clearance inside each tile edge"
     )
 
@@ -445,7 +485,7 @@ class CS2WDProperties(bpy.types.PropertyGroup):
 
     tile_padding: bpy.props.FloatProperty(
         name="Tile Padding",
-        default=0.0,
+        default=0.002,
         min=0.0,
         max=0.05,
         subtype='FACTOR',
@@ -459,6 +499,23 @@ class CS2WDProperties(bpy.types.PropertyGroup):
         max=0.05,
         subtype='FACTOR',
         description="Minimum island gap in atlas UV units, counted once between islands or rows"
+    )
+
+    # Display percentages without migrating saved UV values or enum identifiers.
+    tile_padding_percent: bpy.props.FloatProperty(
+        name="Tile Padding", default=1.0, min=0.0, max=25.0,
+        soft_max=5.0, precision=2, step=10, subtype='PERCENTAGE',
+        description="Clearance inside each tile edge as a percentage of one tile's width",
+        get=lambda self: self.tile_padding / TILE_PERCENT_UV,
+        set=lambda self, value: setattr(self, "tile_padding", value * TILE_PERCENT_UV),
+    )
+
+    island_padding_percent: bpy.props.FloatProperty(
+        name="Island Padding", default=0.5, min=0.0, max=25.0,
+        soft_max=5.0, precision=2, step=10, subtype='PERCENTAGE',
+        description="Gap between islands or rows as a percentage of one tile's width",
+        get=lambda self: self.island_padding / TILE_PERCENT_UV,
+        set=lambda self, value: setattr(self, "island_padding", value * TILE_PERCENT_UV),
     )
 
     randomize_distribution: bpy.props.BoolProperty(
@@ -586,7 +643,7 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
             max_x = max(v.x for v in coords)
             min_y = min(v.y for v in coords)
             max_y = max(v.y for v in coords)
-            size = Vector((max_x - min_x, max_y - min_y))
+            size = (max_x - min_x, max_y - min_y)
             centroid = Vector((0.0, 0.0))
             for c in coords:
                 centroid += c
@@ -649,7 +706,7 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
         for r in range(rows):
             for c in range(cols):
                 tiles.append({
-                    "pos": Vector((c * tile_w, 1.0 - (r + 1) * tile_h)),
+                    "pos": (c / cols, (rows - 1 - r) / rows),
                     "islands": []
                 })
 
@@ -671,58 +728,51 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
         tiles_used = sum(bool(tile["islands"]) for tile in tiles)
         summary = f"{len(island_data)} islands, {tiles_used} tiles used"
 
-        # Plan all target coordinates before validating or writing any UVs.
-        proposed = []
+        padding = f"Tile Padding {tile_padding:.6g} UV, Island Padding {island_padding:.6g} UV"
+        upscale = "on" if props.allow_upscale else "off"
+        # Keep the original and target coordinates until every tile has passed.
+        placements = []
         for ti, tile in enumerate(tiles):
             if not tile["islands"]:
                 continue
-            try:
-                plan = _plan_tile(tile["islands"], tile["pos"], tile_w, tile_h,
-                                  tile_padding, island_padding, props.allow_upscale)
-            except ValueError as exc:
-                self.report({'WARNING'}, f"{summary}. Insufficient tile space in tile {ti + 1}: "
-                            f"{exc}; reduce padding or enable more categories")
-                return {'CANCELLED'}
-            targets = []
-            for data, (scale, offset, _) in zip(tile["islands"], plan):
-                offset = Vector(offset)
-                targets.append((scale, [
-                    (uv, orig, (orig - data["min"]) * scale + offset)
-                    for uv, orig in zip(data["uvs"], data["coords"])
-                ]))
-            proposed.append((tile["pos"], targets))
-
-        # Validate the coordinates Blender will store, including float32 rounding.
-        placements = []
-        overlaps = outside = missing_gap = invalid = 0
-        for (x, y), targets in proposed:
-            boxes = []
-            for scale, writes in targets:
-                coords = [target for _, _, target in writes]
-                if not math.isfinite(scale) or scale <= 0 or not coords or not all(
-                        math.isfinite(v) for co in coords for v in co):
-                    invalid += 1
-                    continue
-                lo = [min(co[a] for co in coords) for a in (0, 1)]
-                hi = [max(co[a] for co in coords) for a in (0, 1)]
-                if any(high <= low for low, high in zip(lo, hi)):
-                    invalid += 1
-                    continue
-                boxes.append((*lo, *hi))
-                placements.extend(writes)
+            x, y = tile["pos"]
             bounds = (x + tile_padding, y + tile_padding,
                       x + tile_w - tile_padding, y + tile_h - tile_padding)
-            o, b, g = _validate_tile_layout(boxes, bounds, island_padding)
-            overlaps += o
-            outside += b
-            missing_gap += g
-
-        summary += f", {overlaps} overlaps, {outside} out of bounds"
-        if overlaps or outside or missing_gap or invalid:
-            self.report({'WARNING'}, f"{summary}. Insufficient tile space or invalid UVs: {missing_gap} pairs below required spacing, "
-                        f"{invalid} invalid islands. Reduce padding or enable more categories; "
-                        "check degenerate UVs if the problem persists")
-            return {'CANCELLED'}
+            try:
+                if not all(math.isfinite(v) for data in tile["islands"]
+                           for co in data["coords"] for v in co):
+                    raise ValueError("non-finite source UVs; re-unwrap the affected faces")
+                plan = _plan_tile(tile["islands"], tile["pos"], tile_w, tile_h,
+                                  tile_padding, island_padding, props.allow_upscale,
+                                  stored_uvs=True)
+                boxes = []
+                for data, (scale, offset, _) in zip(tile["islands"], plan):
+                    origin = data["min"]
+                    # Keep intermediate values in double precision; round only
+                    # when constructing the Vector that Blender will store.
+                    writes = [
+                        (uv, orig, Vector(tuple((orig[a] - origin[a]) * scale + offset[a]
+                                                for a in (0, 1))))
+                        for uv, orig in zip(data["uvs"], data["coords"])
+                    ]
+                    coords = [target for _, _, target in writes]
+                    if not coords or not all(math.isfinite(v) for co in coords for v in co):
+                        raise ValueError("invalid target UV coordinates")
+                    lo = [min(co[a] for co in coords) for a in (0, 1)]
+                    hi = [max(co[a] for co in coords) for a in (0, 1)]
+                    if any(high <= low for low, high in zip(lo, hi)):
+                        raise ValueError("an island would collapse at Blender UV precision")
+                    boxes.append((*lo, *hi))
+                    placements.extend(writes)
+                overlaps, outside, missing_gap = _validate_tile_layout(boxes, bounds, island_padding)
+                if overlaps or outside or missing_gap:
+                    raise ValueError(f"stored UVs would have {overlaps} overlaps, {outside} out of bounds, "
+                                     f"and {missing_gap} pairs below the required spacing")
+            except ValueError as exc:
+                self.report({'WARNING'}, f"Insufficient tile space in tile {ti + 1} "
+                            f"({len(tile['islands'])} islands; {padding}; Allow Upscale {upscale}): "
+                            f"{exc}. Reduce padding, enable more categories, or select fewer islands.")
+                return {'CANCELLED'}
 
         # Commit only after the entire atlas passes validation.
         try:
@@ -746,7 +796,7 @@ class CS2WD_OT_DistributeUV(bpy.types.Operator):
 
         if DEBUG_TILE_SCALES:
             print(f"cs2wd DISTRIBUTE: distributed {len(island_data)} islands across {len(updated)} object(s)")
-        self.report({'INFO'}, summary)
+        self.report({'INFO'}, f"{summary}, 0 overlaps, 0 out of bounds")
         return {'FINISHED'}
 
 # -----------------------------
@@ -863,8 +913,8 @@ class CS2WD_PT_MainPanel(bpy.types.Panel):
             edge, gap = _effective_padding(props)
             layout.label(text=f"UV: Edge {edge:.6g} / Gap {gap:.6g}")
         else:
-            layout.prop(props, "tile_padding")
-            layout.prop(props, "island_padding")
+            layout.prop(props, "tile_padding_percent")
+            layout.prop(props, "island_padding_percent")
         try:
             _validate_padding(0.2, 0.2, *_effective_padding(props))
         except ValueError as exc:

@@ -1,11 +1,14 @@
 """Pure Python: python3 -B tests/check_packing_math.py (no Blender imports)."""
 import ast
 import math
+import struct
+from fractions import Fraction
 from pathlib import Path
 source = ast.parse((Path(__file__).resolve().parents[1] / '__init__.py').read_text())
-namespace = {'math': math}
+namespace = {'math': math, 'struct': struct, 'Fraction': Fraction}
 exec(compile(ast.Module(body=[n for n in source.body if isinstance(n, ast.FunctionDef)
-    and n.name in ('_plan_tile', '_validate_padding', '_effective_padding', '_validate_tile_layout')], type_ignores=[]), 'packing', 'exec'), namespace)
+    and n.name in ('_plan_tile', '_validate_padding', '_effective_padding', '_validate_tile_layout',
+                   '_inward_float32')], type_ignores=[]), 'packing', 'exec'), namespace)
 plan = namespace['_plan_tile']
 
 def check(sizes, tp, ip, upscale):
@@ -84,4 +87,27 @@ validate = namespace['_validate_tile_layout']
 assert validate([(0, 0, .05, .05), (.06, 0, .1, .05)], (0, 0, .2, .2), .01) == (0, 0, 0)
 assert validate([(0, 0, .05, .05), (.055, 0, .1, .05)], (0, 0, .2, .2), .01) == (0, 0, 1)
 assert validate([(0, 0, .05, .05), (.04, -.01, .1, .05)], (0, 0, .2, .2), .01) == (1, 1, 1)
+assert validate([(.4, .8, .6000000238418579, 1)], (.4, .8, .6, 1), 0) == (0, 1, 0)
+assert validate([(0, 0, .05, .05), (.05 - 1e-8, 0, .1, .05)], (0, 0, .2, .2), 0) == (1, 0, 1)
 print("Layout diagnostics: overlap, bounds and short spacing counted separately")
+
+
+def rejects(reason, *args, **kwargs):
+    try:
+        plan(*args, **kwargs)
+    except ValueError as exc:
+        assert reason in str(exc), exc
+    else:
+        raise AssertionError(f"Expected rejection: {reason}")
+
+
+square = {'size': (1, 1)}
+assert len(plan([square] * 4, (.4, .8), .2, .2, .05, .05, True, stored_uvs=True)) == 4
+rejects("required gaps alone", [square] * 36, (.4, .8), .2, .2, 0, .05, True)
+rejects("no usable tile area", [square], (0, 0), .2, .2, .1, 0, True)
+rejects("no usable tile area", [square], (0, 0), math.nan, .2, 0, 0, True)
+rejects("non-finite tile coordinates", [square], (math.inf, 0), .2, .2, 0, 0, True)
+rejects("would collapse", [{'size': (1, 1e-30)}], (.4, .8), .2, .2, 0, 0, True)
+_, _, box = plan([square], (.4, .8), .2, .2, 0, 0, True, stored_uvs=True)[0]
+assert struct.unpack(">f", struct.pack(">f", box[2]))[0] <= .6
+print("Strict stored UV bounds, impossible spacing and precision collapse passed")

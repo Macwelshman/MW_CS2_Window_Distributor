@@ -25,7 +25,7 @@ The add-on places selected UV islands into predefined non-residential or residen
 - A mesh with an existing UV map
 - Window UV islands prepared for placement within the CS2 window atlas
 
-The current source version is **2.7.7**.
+The current source version is **2.7.8**.
 
 ## Installation
 
@@ -126,14 +126,16 @@ Enable one or more groups to combine their tile sets. With no category selected 
 
 Excludes the first and last atlas tiles from distribution. These correspond to the two edge tiles reserved by the add-on as always-on/always-off variants.
 
-Under **Packing**, choose **Pixels** and select the full square atlas resolution
+Under **Packing**, the default **% of Tile** mode measures padding relative to
+the width of one tile, independent of texture resolution. Use **Pixels** when
+you need a specific texel gap, and select the full square atlas resolution
 (512, 1024, 2048, 4096, or **Custom**). Enter Tile Padding and Island Padding
 in pixels. The readout below the fields shows the equivalent atlas UV distances:
 4 px on a 2048 px atlas is 4 ÷ 2048 = 0.001953125 UV. Use the full atlas size,
 not the size of one tile.
 
-Existing scenes retain their UV padding settings. The **UV** and **Pixels**
-modes store separate values, so switching back restores the previous settings
+Previously saved UV padding settings appear as equivalent percentages. The
+**% of Tile** and **Pixels** modes store separate values, so switching back restores the previous settings
 for that mode. Tile Padding applies on both sides of each tile, so it must
 be less than one tenth of the atlas resolution. The panel flags padding that
 leaves no tile area. If the assigned islands and their spacing cannot fit,
@@ -143,8 +145,8 @@ distribution cancels before editing any UVs.
 
 Adds space between the UV islands and the outer edge of each atlas tile.
 
-- Default: `0.0`
-- Range: `0.0–0.05`
+- Default: **1%** per edge (0.002 atlas UV), or **4 px** in Pixels mode.
+- Percentage range: **0–25%** of one tile.
 
 Increase this slightly if texture filtering or mipmapping causes neighbouring tiles to bleed into the selected window.
 
@@ -152,8 +154,8 @@ Increase this slightly if texture filtering or mipmapping causes neighbouring ti
 
 Adds spacing between multiple islands packed into the same atlas tile.
 
-- Default: `0.001`
-- Range: `0.0–0.05`
+- Default: **0.5%** (0.001 atlas UV), or **2 px** in Pixels mode.
+- Percentage range: **0–25%** of one tile.
 
 Very high values can leave too little room for the UV islands. Distribution validates every tile before writing any UV coordinates and cancels with a warning if there is insufficient space. Original UVs remain unchanged on failure.
 
@@ -205,6 +207,8 @@ The add-on gathers the selected islands from all editable mesh objects, distribu
 Each tile starts at its padded upper-left corner. Islands advance left to right by their actual width plus Island Padding. Each new row starts below the tallest island in the preceding row, with the same gap. The add-on chooses row breaks and one shared scale per tile, preserving each island's proportions.
 
 Distribution validates the full atlas before writing UVs. The operator reports the number of islands, tiles used, overlaps and out-of-bounds islands. If a layout cannot fit, reduce padding, enable more tile categories, or select fewer islands and try again.
+
+The warning identifies the failing tile and its padding settings. Some layouts are impossible from the minimum gaps alone. Other failures may reflect the row layout, island order or Blender's UV precision; the add-on does not try every possible arrangement.
 
 ## Recommended workflow
 
@@ -267,7 +271,7 @@ Increase **Tile Padding** slightly. Final requirements depend on the atlas resol
 Repository installations use Blender's normal **Check for Updates** workflow.
 Manual installations must be replaced with the newer release ZIP.
 
-The version installed from the current source should appear as **2.7.7**.
+The version installed from the current source should appear as **2.7.8**.
 
 ## Development
 
@@ -288,7 +292,7 @@ MW_CS2_Window_Distributor/
 ├── blender_manifest.toml
 ├── README.md
 └── dist/
-    └── mw_cs2_window_distributor-2.7.7.zip
+    └── mw_cs2_window_distributor-2.7.8.zip
 ```
 
 ## Disclaimer
@@ -321,3 +325,9 @@ Packing uses atlas UV units internally: the atlas spans 0–1 and each tile is 0
 - Validate the whole layout before editing UVs. Distribution reports island, tile, overlap and out-of-bounds counts.
 - Support pixel padding with preset or custom atlas resolution alongside legacy UV padding.
 - Packing regression suite passed through Flue on Blender 5.2.3 LTS and Blender 5.3.0 Beta and Release Candidate.
+
+## Version 2.7.8
+
+- Enter padding as a percentage of one tile's width. Tile Padding defaults to 1% per edge and Island Padding to 0.5%. Pixels mode remains available, and previously saved padding values retain their distances.
+- Validate UVs at Blender's storage precision before editing any mesh. If packing fails, the warning identifies the tile and its settings.
+- Verified the registered distribution operator and exact multi-object Undo in Blender 5.3.0.
